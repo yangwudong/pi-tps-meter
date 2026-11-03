@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@jack-yang/pi-tps-meter",
+  "version": "0.1.0",
+  "description": "Live TPS / AVG / TTFT meter for the pi coding agent, calibrated against authoritative token counts (port of opencode-tps-meter)",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "tps",
+    "tokens-per-second",
+    "ttft",
+    "llm"
+  ],
+  "author": "Jack Yang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yangwudong/pi-tps-meter.git"
+  },
+  "homepage": "https://github.com/yangwudong/pi-tps-meter#readme",
+  "bugs": {
+    "url": "https://github.com/yangwudong/pi-tps-meter/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/yangwudong/pi-tps-meter/main/docs/screenshot-status.png"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  }
+}

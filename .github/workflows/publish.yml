@@ -1,0 +1,38 @@
+name: Publish
+
+# Runs when a GitHub Release is published. Authenticates through npm Trusted Publishing (OIDC):
+# no token secret, and npm attaches provenance automatically.
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - run: npm test
+      - name: Publish
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          # A release must match package.json, or a forgotten version bump would go unnoticed.
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::release tag $GITHUB_REF_NAME does not match package.json version v$VERSION"
+            exit 1
+          fi
+          # Already on npm (e.g. published by hand): nothing to do, rather than a failing run.
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already on npm; skipping."
+            exit 0
+          fi
+          npm publish
