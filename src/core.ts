@@ -36,6 +36,7 @@ export type MeterState = {
   lastDeltaAt: number | undefined // lastDeltaByMessage
   estimatedTokens: number // estimatedTokensByMessage
   ttftMs: number | undefined // liveTtftBySession
+  thinking: boolean // thinkingBySession: the latest delta was reasoning (drives the particle stream)
 }
 
 export type MeterReading = {
@@ -93,6 +94,7 @@ export function createMeterState(): MeterState {
     lastDeltaAt: undefined,
     estimatedTokens: 0,
     ttftMs: undefined,
+    thinking: false,
   }
 }
 
@@ -118,6 +120,7 @@ export function startMessage(state: MeterState, at: number): void {
   state.lastDeltaAt = undefined
   state.estimatedTokens = 0
   state.samples = []
+  state.thinking = false
 }
 
 // One streamed chunk (the original's recordDelta). Every kind feeds the window, the span and the
@@ -133,6 +136,9 @@ export function recordDelta(state: MeterState, at: number, delta: string, kind: 
   if (state.firstDeltaAt === undefined) state.firstDeltaAt = at
   state.lastDeltaAt = at
   state.estimatedTokens += rawTokens
+  // As the original's setThinking: reasoning turns it on; text and the tool-call stream (the
+  // original cleared it on tool input start) turn it off.
+  state.thinking = kind === "thinking"
   if (kind === "toolcall" || state.ttftMs !== undefined || state.ttftOrigin === undefined) return false
   state.ttftMs = Math.max(0, at - state.ttftOrigin)
   return true
@@ -178,6 +184,7 @@ function endMessage(state: MeterState): void {
   state.lastDeltaAt = undefined
   state.estimatedTokens = 0
   state.samples = []
+  state.thinking = false
 }
 
 // What the meter shows at `now` (the original's MeterDisplay sync).

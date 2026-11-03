@@ -1,6 +1,7 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
-import { formatTps, formatTtft, paint, renderLine, speedHue, speedTier, ttftHue, ttftTier, type Tiers } from "../src/format.ts"
+import { alignRight, formatTps, formatTtft, paint, renderLine, speedHue, speedTier, ttftHue, ttftTier, visibleWidth, withSpinner, type Tiers } from "../src/format.ts"
+import type { Rgb } from "../src/spinner.ts"
 
 const TIERS: Tiers = { tps: { slow: 20, normal: 50, fast: 100 }, ttft: { fast: 10_000, ok: 20_000 } }
 
@@ -149,5 +150,56 @@ describe("renderLine", () => {
     const plain = renderLine({ tps: 61, avg: 12.25, ttftMs: 1_234 }, TIERS, false)
     assert.equal(plain, "TPS 61.0 | AVG 12.3 | TTFT 1.2s")
     assert.ok(!plain.includes("\x1b"))
+  })
+})
+
+describe("particle stream layout", () => {
+  const A: Rgb = { r: 1, g: 2, b: 3 }
+  const B: Rgb = { r: 4, g: 5, b: 6 }
+  const cells = [{ glyph: "⠁", color: A }, { glyph: " ", color: A }, { glyph: "⠂", color: B }]
+  const paintRgb = (text: string, c: Rgb) => `<${c.r}>${text}`
+
+  it("follows TTFT with the newest particle first, as the original", () => {
+    assert.equal(withSpinner("TTFT 1.0s", cells, paintRgb, "after"), "TTFT 1.0s <1>⠁\u2800<4>⠂")
+  })
+
+  it("is mirrored before a right-aligned reading, newest particle next to TPS", () => {
+    assert.equal(withSpinner("TPS 1.00", cells, paintRgb, "before"), "<4>⠂\u2800<1>⠁ TPS 1.00")
+  })
+
+  it("renders gaps as the empty braille cell, which pi's status sanitizer neither collapses nor trims", () => {
+    const gaps = [{ glyph: " ", color: A }, { glyph: " ", color: A }]
+    const out = withSpinner("x", gaps, paintRgb, "after")
+    assert.equal(out, "x \u2800\u2800")
+    assert.equal(out.replace(/ +/g, " ").trim(), out, "unchanged by pi's sanitizeStatusText")
+    assert.notEqual("x \u00a0".trim(), "x \u00a0", "why not a no-break space: trim() strips it")
+  })
+})
+
+describe("right alignment", () => {
+  it("measures columns without ANSI codes", () => {
+    assert.equal(visibleWidth("\x1b[33m42.5\x1b[39m"), 4)
+    assert.equal(visibleWidth("⠁\u2800⠂ TPS"), 7)
+  })
+
+  it("pads a line so it ends in the last column", () => {
+    const out = alignRight("\x1b[2mTPS\x1b[22m", 10)
+    assert.equal(out, "       \x1b[2mTPS\x1b[22m")
+    assert.equal(visibleWidth(out), 10)
+  })
+
+  it("cuts a line wider than the terminal from the left, so the particles go first", () => {
+    assert.equal(alignRight("⠁⠂ TPS 42.5 | AVG 38.2", 8), "AVG 38.2")
+    assert.equal(alignRight("\x1b[33mTPS 42.5\x1b[39m", 3), "2.5", "colours are dropped when cutting")
+  })
+
+  it("never cuts through an escape sequence of a theme-painted stream", () => {
+    const painted = withSpinner("TPS 42.5", [{ glyph: "⠁", color: { r: 0, g: 229, b: 255 } }, { glyph: "⠂", color: { r: 41, g: 121, b: 255 } }],
+      (t, c) => `\x1b[38;2;${c.r};${c.g};${c.b}m${t}\x1b[39m`, "before")
+    for (let width = 1; width <= visibleWidth(painted); width++) {
+      const out = alignRight(painted, width)
+      assert.equal(visibleWidth(out), width)
+      assert.ok(!/\x1b(?!\[[0-9;]*m)|\[[0-9;]*m/.test(out.replace(/\x1b\[[0-9;]*m/g, "")), `no escape fragments at width ${width}: ${JSON.stringify(out)}`)
+    }
   })
 })

@@ -6,10 +6,16 @@ import { dirname, join } from "node:path"
 import { DISPLAY_MODES, agentDir, configPath, isDisplayMode, loadConfig, nextMode, resolveConfig, saveMode } from "../src/config.ts"
 
 describe("resolveConfig", () => {
-  it("defaults to status mode and the original's thresholds", () => {
+  it("defaults to the right-aligned mode, the original's thresholds and the tech spinner", () => {
     assert.deepEqual(resolveConfig(undefined), {
-      mode: "status",
+      mode: "right",
       tiers: { tps: { slow: 20, normal: 50, fast: 100 }, ttft: { fast: 10_000, ok: 20_000 } },
+      spinner: {
+        enabled: true,
+        colors: [{ r: 0, g: 229, b: 255 }, { r: 41, g: 121, b: 255 }, { r: 101, g: 31, b: 255 }],
+        intervalMs: 100,
+        cells: 6,
+      },
     })
   })
 
@@ -22,23 +28,43 @@ describe("resolveConfig", () => {
 
   it("falls back on malformed values instead of mis-tiering", () => {
     const c = resolveConfig({ mode: "loud", tiers: { tps: { slow: "20", normal: null, fast: NaN }, ttft: [] } })
-    assert.equal(c.mode, "status")
+    assert.equal(c.mode, "right")
     assert.deepEqual(c.tiers, resolveConfig(undefined).tiers)
     assert.deepEqual(resolveConfig([1, 2]), resolveConfig(undefined))
     assert.deepEqual(resolveConfig("status"), resolveConfig(undefined))
   })
+
+  it("resolves spinner options like the original", () => {
+    const red = resolveConfig({ spinner: { theme: "red" } }).spinner
+    assert.deepEqual(red.colors[0], { r: 255, g: 23, b: 68 })
+    assert.equal(resolveConfig({ spinner: { theme: "none" } }).spinner.enabled, false)
+    assert.equal(resolveConfig({ spinner: { enabled: false } }).spinner.enabled, false)
+    assert.equal(resolveConfig({ spinner: { theme: "nope" } }).spinner.colors.length, 3, "unknown theme falls back to tech")
+    const custom = resolveConfig({ spinner: { colors: ["#ffffff", "bad", 7, "#000"], intervalMs: 80, cells: 9.7 } }).spinner
+    assert.deepEqual(custom.colors, [{ r: 255, g: 255, b: 255 }, { r: 0, g: 0, b: 0 }], "custom colours win; invalid entries are dropped")
+    assert.equal(custom.intervalMs, 80)
+    assert.equal(custom.cells, 9)
+  })
+
+  it("rejects spinner values the original rejected", () => {
+    const s = resolveConfig({ spinner: { colors: ["bad"], intervalMs: 0, cells: 1 } }).spinner
+    assert.equal(s.colors.length, 3, "no valid custom colour: preset")
+    assert.equal(s.intervalMs, 100)
+    assert.equal(s.cells, 6, "fewer than 2 cells: default")
+  })
 })
 
 describe("display modes", () => {
-  it("cycles status → widget → off → status", () => {
-    assert.deepEqual(DISPLAY_MODES, ["status", "widget", "off"])
+  it("cycles right → status → widget → off → right", () => {
+    assert.deepEqual(DISPLAY_MODES, ["right", "status", "widget", "off"])
+    assert.equal(nextMode("right"), "status")
     assert.equal(nextMode("status"), "widget")
     assert.equal(nextMode("widget"), "off")
-    assert.equal(nextMode("off"), "status")
+    assert.equal(nextMode("off"), "right")
   })
 
-  it("recognises only the three modes", () => {
-    assert.ok(isDisplayMode("status") && isDisplayMode("widget") && isDisplayMode("off"))
+  it("recognises only the four modes", () => {
+    assert.ok(isDisplayMode("right") && isDisplayMode("status") && isDisplayMode("widget") && isDisplayMode("off"))
     assert.ok(!isDisplayMode("live") && !isDisplayMode("") && !isDisplayMode(undefined))
   })
 })

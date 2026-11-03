@@ -1,19 +1,24 @@
 // pi-tps-meter — live TPS / AVG / TTFT for the pi coding agent.
 //
-// Port of opencode-tps-meter: the measurement core (src/core.ts) and the formatting
-// (src/format.ts) are the original's. This file is the replaced host layer: pi events in,
-// a footer status line or a widget above the editor out.
+// Port of opencode-tps-meter: the measurement core (src/core.ts), the formatting (src/format.ts)
+// and the thinking particle stream (src/spinner.ts) are the original's. This file is the replaced
+// host layer: pi events in; a right-aligned line below the editor, a footer status, or a line
+// above the editor out.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { DISPLAY_MODES, isDisplayMode, loadConfig, nextMode, resolveConfig, saveMode, type DisplayMode, type MeterConfig } from "../src/config.ts"
 import { abandonMessage, completeMessage, createMeterState, readMeter, recordDelta, startMessage, startTurn, type DeltaKind, type MeterState } from "../src/core.ts"
-import { renderLine } from "../src/format.ts"
+import { alignRight, renderLine, withSpinner } from "../src/format.ts"
+import { advanceSpinner, createSpinner, spinnerCells, type Rgb, type SpinnerState } from "../src/spinner.ts"
 
-// One key for both surfaces: the footer status entry and the widget.
+// One key for every surface: the footer status entry and the widget.
 const KEY = "tps-meter"
 
 // ~10Hz: smooth enough for a rolling number without re-rendering on every delta.
 const REFRESH_MS = 100
+
+// Older particles fade toward this neutral grey (the original faded toward the theme's muted text).
+const SPINNER_MUTED: Rgb = { r: 128, g: 132, b: 142 }
 
 type UI = ExtensionContext["ui"]
 
@@ -23,17 +28,42 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   // start a session, so it does no IO and starts no timers.
   let config: MeterConfig = resolveConfig(undefined)
   let ui: UI | undefined
-  let color = false
+  let tui = false
   let ticker: ReturnType<typeof setInterval> | undefined
+  let spinner: SpinnerState | undefined
   // What is on screen right now, so unchanged readings cost no re-render.
   let shownMode: DisplayMode | undefined
   let shownLine: string | undefined
+  // The mounted right-aligned component's host, told to redraw when the line changes.
+  let rightHost: { requestRender(): void } | undefined
 
   // Handlers re-bind from their own ctx; the ticker only ever uses the latest binding.
   const bind = (ctx: ExtensionContext): void => {
     ui = ctx.hasUI ? ctx.ui : undefined
-    // The TUI renders ANSI in status text and widget lines; RPC clients get plain text.
-    color = ctx.mode === "tui"
+    // The TUI renders ANSI and components; RPC clients get plain text lines.
+    tui = ctx.mode === "tui"
+  }
+
+  // The particle stream exists only while reasoning streams, and only in the TUI (in RPC it would
+  // just be noise at 10Hz). A fresh stream starts each time thinking starts.
+  const decorate = (target: UI, line: string, now: number): string => {
+    if (!tui || !config.spinner.enabled || !state.thinking) {
+      spinner = undefined
+      return line
+    }
+    if (spinner === undefined) spinner = createSpinner(config.spinner.cells, now, Math.random)
+    else advanceSpinner(spinner, config.spinner, now, Math.random)
+    const paint = (text: string, c: Rgb) => target.theme.style(text, { fg: { kind: "rgb", r: c.r, g: c.g, b: c.b } })
+    return withSpinner(line, spinnerCells(spinner, config.spinner, SPINNER_MUTED), paint, config.mode === "right" ? "before" : "after")
+  }
+
+  // A component rather than a string widget: it right-aligns itself to the width of every render,
+  // so it stays in the corner across terminal resizes, and an update is only a redraw request.
+  const mountRight = (target: UI): void => {
+    target.setWidget(KEY, (host) => {
+      rightHost = host
+      return { render: (width: number) => [alignRight(shownLine ?? "", width)], invalidate() {} }
+    }, { placement: "belowEditor" })
   }
 
   const render = (): void => {
@@ -42,16 +72,22 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     if (mode !== shownMode) {
       // Exactly one surface (or none) shows the meter: clear the one being left.
       if (shownMode === "status") ui.setStatus(KEY, undefined)
-      if (shownMode === "widget") ui.setWidget(KEY, undefined)
+      if (shownMode === "widget" || shownMode === "right") ui.setWidget(KEY, undefined)
+      rightHost = undefined
       shownMode = mode
       shownLine = undefined
+      if (mode === "right" && tui) mountRight(ui)
     }
     if (mode === "off") return
-    const line = renderLine(readMeter(state, Date.now()), config.tiers, color)
+    const now = Date.now()
+    const line = decorate(ui, renderLine(readMeter(state, now), config.tiers, tui), now)
     if (line === shownLine) return
     shownLine = line
     if (mode === "status") ui.setStatus(KEY, line)
-    else ui.setWidget(KEY, [line])
+    else if (mode === "widget") ui.setWidget(KEY, [line])
+    // RPC ignores component widgets; there the line goes out as plain text below the editor.
+    else if (tui) rightHost?.requestRender()
+    else ui.setWidget(KEY, [line], { placement: "belowEditor" })
   }
 
   const stopTicker = (): void => {
@@ -130,10 +166,12 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     // reference to this session's UI are the only things left for us to drop.
     stopTicker()
     ui = undefined
+    rightHost = undefined
+    spinner = undefined
   })
 
   pi.registerCommand("tps", {
-    description: "TPS meter display: /tps cycles status → widget → off, /tps status|widget|off sets it",
+    description: "TPS meter display: /tps cycles right → status → widget → off, /tps right|status|widget|off sets it",
     getArgumentCompletions: (prefix) => {
       // Only strict prefixes: pi's editor makes Enter apply an open argument completion instead
       // of submitting, so a fully typed mode must close the popup or `/tps off` needs two Enters.
@@ -145,7 +183,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       bind(ctx)
       const arg = args.trim().toLowerCase()
       if (arg && !isDisplayMode(arg)) {
-        ctx.ui.notify(`tps-meter: unknown mode "${arg}" (use status | widget | off)`, "error")
+        ctx.ui.notify(`tps-meter: unknown mode "${arg}" (use right | status | widget | off)`, "error")
         return
       }
       const mode = isDisplayMode(arg) ? arg : nextMode(config.mode)

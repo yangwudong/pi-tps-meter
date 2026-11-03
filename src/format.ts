@@ -1,7 +1,9 @@
-// Display formatting and tier colouring, ported from opencode-tps-meter/tui.tsx.
+// Display formatting and tier colouring, ported from opencode-tps-meter/tui.tsx, plus the layout
+// of the thinking particle stream and right alignment.
 // Pure: no pi imports. The caller decides whether the host renders ANSI.
 
 import type { MeterReading } from "./core.ts"
+import type { Rgb, SpinnerCell } from "./spinner.ts"
 
 export type TpsTiers = { slow: number; normal: number; fast: number }
 export type TtftTiers = { fast: number; ok: number }
@@ -101,4 +103,37 @@ export function renderLine(reading: MeterReading, tiers: Tiers, color: boolean):
     ttftCell(reading.ttftMs, tiers.ttft),
   ]
   return cells.map((c) => (color ? paint(c.text, c.hue) : c.text)).join("")
+}
+
+// Gaps in the stream are U+2800, the empty braille cell: one column, blank on screen, and not
+// whitespace. pi's footer sanitizer collapses runs of spaces and trims both ends of a status (JS
+// trim() also strips no-break spaces), either of which would make the stream jitter in width.
+const GAP = "\u2800"
+
+// The particle stream flows away from the meter. After the reading (status / widget) it runs
+// left to right, newest cell next to TTFT, as in the original. Before a right-aligned reading it
+// is mirrored, newest cell next to TPS, so the reading itself never moves.
+export function withSpinner(
+  line: string,
+  cells: SpinnerCell[],
+  paintRgb: (text: string, color: Rgb) => string,
+  side: "before" | "after",
+): string {
+  const ordered = side === "after" ? cells : [...cells].reverse()
+  const stream = ordered.map((c) => (c.glyph === " " ? GAP : paintRgb(c.glyph, c.color))).join("")
+  return side === "after" ? `${line} ${stream}` : `${stream} ${line}`
+}
+
+// Terminal columns of a string produced here: ANSI SGR codes take none, and every character used
+// (ASCII, braille) takes exactly one.
+export function visibleWidth(text: string): number {
+  return [...text.replace(/\x1b\[[0-9;]*m/g, "")].length
+}
+
+// Pads `line` so it ends in the last column. A line too wide for the terminal loses its colours and
+// is cut, because a TUI line must never exceed the width it is given.
+export function alignRight(line: string, width: number): string {
+  const w = visibleWidth(line)
+  if (w <= width) return " ".repeat(width - w) + line
+  return [...line.replace(/\x1b\[[0-9;]*m/g, "")].slice(w - width).join("")
 }

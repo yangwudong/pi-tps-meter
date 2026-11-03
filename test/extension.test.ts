@@ -8,32 +8,58 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import tpsMeter from "../extensions/index.ts"
+import { visibleWidth } from "../src/format.ts"
 
 type Handler = (event: Record<string, unknown>, ctx: unknown) => unknown
 type Command = { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions?: (prefix: string) => unknown }
-type UiCall = { surface: "status" | "widget"; value: string | string[] | undefined; at: number }
+type Component = { render(width: number): string[] }
+type Factory = (host: { requestRender(): void }, theme: unknown) => Component
+type UiCall = { surface: "status" | "widget"; value: string | string[] | undefined; placement?: string; at: number }
 
 const IDLE = "TPS -- | AVG -- | TTFT --"
+const BRAILLE = /[\u2800-\u28ff]/
+const ANSI = /\x1b\[[0-9;]*m/g
+const plain = (s: unknown) => String(s).replace(ANSI, "")
 
-function setup(opts: { mode?: "tui" | "rpc"; hasUI?: boolean } = {}) {
+let agentDir: string
+const configFile = () => join(agentDir, "pi-tps-meter", "config.json")
+const writeConfig = (cfg: unknown) => {
+  mkdirSync(join(agentDir, "pi-tps-meter"), { recursive: true })
+  writeFileSync(configFile(), typeof cfg === "string" ? cfg : JSON.stringify(cfg))
+}
+
+// `display` writes config.json before session_start reads it; `ctxMode` is pi's run mode.
+function setup(opts: { ctxMode?: "tui" | "rpc"; hasUI?: boolean; display?: string; config?: object } = {}) {
+  if (opts.display || opts.config) writeConfig({ ...opts.config, ...(opts.display ? { mode: opts.display } : {}) })
   const handlers = new Map<string, Handler[]>()
   const commands = new Map<string, Command>()
   const calls: UiCall[] = []
   const notes: { message: string; level?: string }[] = []
+  const host = { renders: 0, requestRender() { host.renders++ } }
+  let component: Component | undefined
   const ui = {
+    // Same output shape as pi's theme.style() for an RGB colour (truecolor SGR + default-fg reset),
+    // so width measurement sees exactly what it sees in pi.
+    theme: { style: (text: string, o: { fg: { r: number; g: number; b: number } }) => `\x1b[38;2;${o.fg.r};${o.fg.g};${o.fg.b}m${text}\x1b[39m` },
     setStatus(key: string, text: string | undefined) {
       assert.equal(key, "tps-meter")
       calls.push({ surface: "status", value: text, at: Date.now() })
     },
-    setWidget(key: string, lines: string[] | undefined) {
+    setWidget(key: string, content: string[] | Factory | undefined, options?: { placement?: string }) {
       assert.equal(key, "tps-meter")
-      calls.push({ surface: "widget", value: lines, at: Date.now() })
+      if (typeof content === "function") {
+        component = content(host, ui.theme)
+        calls.push({ surface: "widget", value: "<component>", placement: options?.placement, at: Date.now() })
+        return
+      }
+      if (content === undefined) component = undefined
+      calls.push({ surface: "widget", value: content, placement: options?.placement, at: Date.now() })
     },
     notify(message: string, level?: string) {
       notes.push({ message, level })
     },
   }
-  const ctx = { hasUI: opts.hasUI ?? true, mode: opts.mode ?? "rpc", ui }
+  const ctx = { hasUI: opts.hasUI ?? true, mode: opts.ctxMode ?? "rpc", ui }
   const pi = {
     on(event: string, handler: Handler) {
       handlers.set(event, [...(handlers.get(event) ?? []), handler])
@@ -54,7 +80,10 @@ function setup(opts: { mode?: "tui" | "rpc"; hasUI?: boolean } = {}) {
     commands,
     calls,
     notes,
+    host,
     emit,
+    // What the mounted right-aligned component draws at `width` columns.
+    rendered: (width = 80) => component?.render(width)[0],
     tps: (args: string) => commands.get("tps")!.handler(args, ctx),
     statusLines,
     lastStatus: () => statusLines().at(-1),
@@ -67,15 +96,13 @@ function setup(opts: { mode?: "tui" | "rpc"; hasUI?: boolean } = {}) {
   }
 }
 
-// Streams `count` text deltas of 8 ASCII bytes (2 raw tokens) every `everyMs`.
-function streamText(h: ReturnType<typeof setup>, count: number, everyMs: number) {
+// Streams `count` deltas of 8 ASCII bytes (2 raw tokens) every `everyMs`.
+function stream(h: ReturnType<typeof setup>, count: number, everyMs: number, type: "text_delta" | "thinking_delta" = "text_delta") {
   for (let i = 0; i < count; i++) {
     mock.timers.tick(everyMs)
-    h.delta("text_delta", "abcdefgh")
+    h.delta(type, "abcdefgh")
   }
 }
-
-let agentDir: string
 
 beforeEach(() => {
   agentDir = mkdtempSync(join(tmpdir(), "pi-tps-meter-ext-"))
@@ -88,8 +115,6 @@ afterEach(() => {
   delete process.env.PI_CODING_AGENT_DIR
   rmSync(agentDir, { recursive: true, force: true })
 })
-
-const configFile = () => join(agentDir, "pi-tps-meter", "config.json")
 
 // The persisted mode; a file that does not parse fails the test with its contents.
 const savedMode = (): unknown => {
@@ -110,13 +135,14 @@ describe("wiring", () => {
     assert.ok(h.commands.has("tps"))
   })
 
-  it("offers the three modes as /tps completions, and none once a mode is fully typed", () => {
+  it("offers the four modes as /tps completions, and none once a mode is fully typed", () => {
     const complete = setup().commands.get("tps")!.getArgumentCompletions!
     assert.deepEqual(complete("w"), [{ value: "widget", label: "widget" }])
-    assert.equal((complete("") as unknown[]).length, 3)
+    assert.deepEqual(complete("r"), [{ value: "right", label: "right" }])
+    assert.equal((complete("") as unknown[]).length, 4)
     assert.equal(complete("x"), null)
     // an open completion would swallow Enter in pi's editor
-    assert.equal(complete("widget"), null)
+    assert.equal(complete("right"), null)
     assert.equal(complete("off"), null)
   })
 
@@ -125,22 +151,60 @@ describe("wiring", () => {
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
-    streamText(h, 20, 50)
+    stream(h, 20, 50)
     h.messageEnd(40)
     mock.timers.tick(5_000)
     assert.deepEqual(h.calls, [])
   })
 })
 
+describe("right-aligned below the editor (default)", () => {
+  it("mounts one component below the editor in the TUI", () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    assert.deepEqual(h.calls.map((c) => [c.surface, c.value, c.placement]), [["widget", "<component>", "belowEditor"]])
+    assert.equal(plain(h.rendered(40)).trimStart(), IDLE)
+  })
+
+  it("ends in the last column at every width, so it stays in the corner across resizes", () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    for (const width of [40, 80, 140]) {
+      const line = h.rendered(width)!
+      assert.equal(visibleWidth(line), width)
+      assert.ok(plain(line).endsWith("TTFT --"))
+    }
+  })
+
+  it("updates by redraw requests, never by re-mounting", () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    h.turnStart()
+    mock.timers.tick(700)
+    h.messageStart()
+    stream(h, 30, 50)
+    assert.equal(h.calls.length, 1, "still the one mount from session_start")
+    assert.ok(h.host.renders > 10, `${h.host.renders} redraw requests`)
+    // stream() ticks before each delta: the first token arrives 0.75s after turn_start
+    assert.match(plain(h.rendered()), /TPS \d.* \| TTFT 0\.8s$/)
+  })
+
+  it("falls back to plain lines below the editor in RPC, which ignores components", () => {
+    const h = setup({ ctxMode: "rpc" })
+    h.emit("session_start", { reason: "startup" })
+    assert.deepEqual(h.calls.at(-1), { surface: "widget", value: [IDLE], placement: "belowEditor", at: 0 })
+  })
+})
+
 describe("streaming", () => {
   it("shows the idle meter at session start", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     assert.deepEqual(h.statusLines(), [IDLE])
   })
 
   it("times TTFT from turn_start and shows it on the first token", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart("user") // the prompt itself: ignored
@@ -153,7 +217,7 @@ describe("streaming", () => {
   })
 
   it("refreshes TPS at ~10Hz while streaming, not on every delta", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
@@ -171,25 +235,25 @@ describe("streaming", () => {
   })
 
   it("does not re-render a reading that has not changed", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
     const start = h.calls.length
-    streamText(h, 150, 20) // a steady 100 TPS: "100" on every tick once the first second is over
+    stream(h, 150, 20) // a steady 100 TPS: "100" on every tick once the first second is over
     const lines = h.calls.slice(start).map((c) => c.value)
     assert.ok(lines.every((line, i) => i === 0 || line !== lines[i - 1]), "an unchanged line is never pushed again")
     assert.ok(lines.length < 20)
   })
 
   it("keeps the AVG/TTFT summary after the stream and stops ticking", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     mock.timers.tick(800)
     h.messageStart()
     h.delta("text_delta", "abcdefgh")
-    streamText(h, 99, 20) // first delta → last delta: 1.98s
+    stream(h, 99, 20) // first delta → last delta: 1.98s
     h.messageEnd(300)
     assert.equal(h.lastStatus(), "TPS -- | AVG 152 | TTFT 0.8s") // 300 tokens / 1.98s
     const settled = h.calls.length
@@ -202,21 +266,21 @@ describe("streaming", () => {
   })
 
   it("blanks TPS after STALE_MS without deltas, and brings it back", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
-    streamText(h, 20, 50)
+    stream(h, 20, 50)
     assert.ok(!String(h.lastStatus()).startsWith("TPS --"))
     mock.timers.tick(1_600)
     assert.ok(String(h.lastStatus()).startsWith("TPS --"), "stale after 1.5s")
-    streamText(h, 3, 50)
+    stream(h, 3, 50)
     mock.timers.tick(100)
     assert.ok(!String(h.lastStatus()).startsWith("TPS --"), "resumed")
   })
 
   it("never ends the TTFT wait on toolcall deltas, but counts them as output", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     mock.timers.tick(1_000)
@@ -231,21 +295,21 @@ describe("streaming", () => {
   })
 
   it("leaves AVG and calibration alone for aborted messages", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
-    streamText(h, 20, 50)
+    stream(h, 20, 50)
     h.messageEnd(1, "aborted")
     assert.match(String(h.lastStatus()), /^TPS -- \| AVG -- \| TTFT 0\.1s$/)
   })
 
   it("stops ticking on session_shutdown", () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
-    streamText(h, 10, 50)
+    stream(h, 10, 50)
     h.emit("session_shutdown", { reason: "quit" })
     const after = h.calls.length
     mock.timers.tick(5_000)
@@ -253,43 +317,120 @@ describe("streaming", () => {
   })
 })
 
+describe("thinking particle stream", () => {
+  it("flows before a right-aligned reading while reasoning streams, and stops when text starts", () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    h.turnStart()
+    h.messageStart()
+    stream(h, 10, 50, "thinking_delta")
+    const thinking = h.rendered()!
+    // The particles are everything between the padding and " TPS "; gap cells are U+2800, so
+    // strip only real spaces (the right-alignment padding).
+    const particles = plain(thinking).replace(/^ +/, "").split(" TPS ")[0]
+    assert.ok(BRAILLE.test(particles), "particles before the reading")
+    assert.equal([...particles].length, 6, "six cells, gaps included")
+    assert.ok([...particles].every((c) => BRAILLE.test(c)), "gaps are U+2800, not spaces")
+    assert.match(thinking, /\x1b\[38;2;\d+;\d+;\d+m/, "painted through the theme with RGB colours")
+    assert.equal(visibleWidth(thinking), 80, "right-aligned to the full width")
+    assert.ok(plain(thinking).endsWith("TTFT 0.1s"), "the reading stays put at the right edge")
+    stream(h, 3, 50, "text_delta")
+    mock.timers.tick(100)
+    assert.ok(!BRAILLE.test(h.rendered()!), "gone once the answer streams")
+  })
+
+  it("keeps moving through a pause in the reasoning stream", () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    h.turnStart()
+    h.messageStart()
+    stream(h, 3, 50, "thinking_delta")
+    const frames = new Set<string>()
+    for (let i = 0; i < 10; i++) {
+      mock.timers.tick(100)
+      frames.add(h.rendered()!)
+    }
+    assert.ok(frames.size >= 8, `${frames.size} distinct frames in 1s without a delta`)
+  })
+
+  it("follows TTFT in status mode, as in the original", () => {
+    const h = setup({ ctxMode: "tui", display: "status" })
+    h.emit("session_start", { reason: "startup" })
+    h.turnStart()
+    h.messageStart()
+    stream(h, 5, 50, "thinking_delta")
+    const line = plain(h.lastStatus())
+    assert.match(line, /^TPS .* \| TTFT 0\.1s /)
+    assert.ok(BRAILLE.test(line.split("TTFT 0.1s ")[1]))
+  })
+
+  it("is not shown when disabled, outside the TUI, or after the message ends", () => {
+    const off = setup({ ctxMode: "tui", display: "status", config: { spinner: { theme: "none" } } })
+    off.emit("session_start", { reason: "startup" })
+    off.turnStart()
+    off.messageStart()
+    stream(off, 5, 50, "thinking_delta")
+    assert.ok(!BRAILLE.test(String(off.lastStatus())), "theme none")
+
+    const rpc = setup({ ctxMode: "rpc", display: "status" })
+    rpc.emit("session_start", { reason: "startup" })
+    rpc.turnStart()
+    rpc.messageStart()
+    stream(rpc, 5, 50, "thinking_delta")
+    assert.ok(!BRAILLE.test(String(rpc.lastStatus())), "RPC")
+
+    const tui = setup({ ctxMode: "tui", display: "status" })
+    tui.emit("session_start", { reason: "startup" })
+    tui.turnStart()
+    tui.messageStart()
+    stream(tui, 5, 50, "thinking_delta")
+    tui.messageEnd(10, "aborted")
+    assert.ok(!BRAILLE.test(String(tui.lastStatus())), "message ended mid-thought")
+  })
+})
+
 describe("/tps", () => {
-  it("cycles status → widget → off → status, moving the meter and persisting the mode", async () => {
+  it("cycles right → status → widget → off → right, moving the meter and persisting the mode", async () => {
     const h = setup()
     h.emit("session_start", { reason: "startup" })
+    assert.deepEqual(h.calls.at(-1), { surface: "widget", value: [IDLE], placement: "belowEditor", at: 0 })
 
     await h.tps("")
-    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value]), [["status", undefined], ["widget", [IDLE]]])
+    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value]), [["widget", undefined], ["status", IDLE]])
+    assert.equal(savedMode(), "status")
+
+    await h.tps("")
+    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value, c.placement]), [["status", undefined, undefined], ["widget", [IDLE], undefined]])
     assert.equal(savedMode(), "widget")
 
     await h.tps("")
-    assert.deepEqual(h.calls.at(-1), { surface: "widget", value: undefined, at: Date.now() })
+    assert.deepEqual(h.calls.at(-1), { surface: "widget", value: undefined, placement: undefined, at: 0 })
     assert.equal(savedMode(), "off")
 
     await h.tps("")
-    assert.deepEqual(h.calls.at(-1), { surface: "status", value: IDLE, at: Date.now() })
-    assert.deepEqual(h.notes.map((n) => n.message), ["tps-meter: widget", "tps-meter: off", "tps-meter: status"])
+    assert.deepEqual(h.calls.at(-1), { surface: "widget", value: [IDLE], placement: "belowEditor", at: 0 })
+    assert.deepEqual(h.notes.map((n) => n.message), ["tps-meter: status", "tps-meter: widget", "tps-meter: off", "tps-meter: right"])
   })
 
   it("sets a mode directly and rejects unknown ones", async () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     await h.tps("off")
     assert.equal(h.lastStatus(), undefined)
     await h.tps("loud")
-    assert.deepEqual(h.notes.at(-1), { message: 'tps-meter: unknown mode "loud" (use status | widget | off)', level: "error" })
+    assert.deepEqual(h.notes.at(-1), { message: 'tps-meter: unknown mode "loud" (use right | status | widget | off)', level: "error" })
     assert.equal(savedMode(), "off")
   })
 
   it("hides the meter completely when off, even mid-stream, and resumes when turned back on", async () => {
-    const h = setup()
+    const h = setup({ display: "status" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
-    streamText(h, 10, 50)
+    stream(h, 10, 50)
     await h.tps("off")
     const hidden = h.calls.length
-    streamText(h, 40, 50)
+    stream(h, 40, 50)
     h.messageEnd(80)
     h.emit("turn_end", { turnIndex: 0 })
     assert.equal(h.calls.length, hidden, "no UI calls while off")
@@ -297,22 +438,27 @@ describe("/tps", () => {
     assert.match(String(h.calls.at(-1)!.value), /AVG \d/)
   })
 
+  it("switching from right unmounts the component", async () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await h.tps("status")
+    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value]), [["widget", undefined], ["status", h.lastStatus()]])
+    assert.equal(h.rendered(), undefined)
+  })
+
   it("starts in the persisted mode and applies tier overrides", () => {
-    mkdirSync(join(agentDir, "pi-tps-meter"), { recursive: true })
-    writeFileSync(configFile(), JSON.stringify({ mode: "widget", tiers: { tps: { slow: 1, normal: 2, fast: 3 } } }))
-    const h = setup({ mode: "tui" })
+    const h = setup({ ctxMode: "tui", config: { mode: "widget", tiers: { tps: { slow: 1, normal: 2, fast: 3 } } } })
     h.emit("session_start", { reason: "startup" })
     assert.equal(h.calls[0].surface, "widget")
     h.turnStart()
     h.messageStart()
-    streamText(h, 20, 50)
+    stream(h, 20, 50)
     const line = String((h.calls.at(-1)!.value as string[])[0])
     assert.match(line, /\x1b\[36m\d+(\.\d+)?\x1b\[39m/, "40 TPS is 'faster' (cyan) with fast = 3")
   })
 
   it("reports an unparsable config file without overwriting it", async () => {
-    mkdirSync(join(agentDir, "pi-tps-meter"), { recursive: true })
-    writeFileSync(configFile(), "{ nope")
+    writeConfig("{ nope")
     const h = setup()
     h.emit("session_start", { reason: "startup" })
     assert.equal(h.notes[0].level, "warning")
@@ -325,10 +471,10 @@ describe("/tps", () => {
 
 describe("colour", () => {
   it("emits ANSI only for the TUI", () => {
-    const tui = setup({ mode: "tui" })
+    const tui = setup({ ctxMode: "tui", display: "status" })
     tui.emit("session_start", { reason: "startup" })
     assert.ok(String(tui.lastStatus()).includes("\x1b[2mTPS \x1b[22m"))
-    const rpc = setup({ mode: "rpc" })
+    const rpc = setup({ ctxMode: "rpc", display: "status" })
     rpc.emit("session_start", { reason: "startup" })
     assert.equal(rpc.lastStatus(), IDLE)
   })

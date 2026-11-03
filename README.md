@@ -9,20 +9,17 @@
 ## 显示效果
 
 ```
-TPS 42.5 | AVG 38.2 | TTFT 0.8s
+⠔⠀⠈⠀⠤⠔ TPS 42.5 | AVG 38.2 | TTFT 0.8s
 ```
 
-底部状态条（`/tps status`，默认），流式输出中：
+默认显示在编辑器下方、右对齐（`/tps right`），紧贴 footer，和下方的模型名右侧对齐；位置固定，不会被其他扩展的 footer 状态（比如 pi-lens 的 `LSP Inactive`）挤开。下图是模型思考时的样子，读数左边是思考粒子流：
 
-![底部状态条模式：流式输出中，TPS 40.8 / AVG 39.8 / TTFT 2.0s](https://raw.githubusercontent.com/yangwudong/pi-tps-meter/main/docs/screenshot-status.png)
-
-编辑器上方组件（`/tps widget`）：
-
-![编辑器上方组件模式：TPS 40.2 / AVG 38.1 / TTFT 3.2s](https://raw.githubusercontent.com/yangwudong/pi-tps-meter/main/docs/screenshot-widget.png)
+![编辑器下方右对齐：思考中，粒子流 + TPS 26.0 / AVG 33.7 / TTFT 3.9s](https://raw.githubusercontent.com/yangwudong/pi-tps-meter/main/docs/screenshot-right.png)
 
 - **TPS**：流式输出时的实时速度，基于 5 秒滑动窗口，约 10Hz 刷新；超过 1.5 秒没有新 token 时显示 `--`。
 - **AVG**：会话级累计平均。所有已完成消息的权威 token 数之和，除以各消息生成时长之和。
 - **TTFT**：从本轮请求开始到第一个文本或思考 token 的时间。首个 token 到达立即显示，一直保留到下一次生成开始。
+- **思考粒子流**：模型流式输出思考内容时，一串盲文点从读数旁流出：最新的一格最亮，越旧越淡，亮色随时间沿渐变色漂移；开始输出正文就消失。只在思考时出现，平时不占位。
 
 流结束后 AVG / TTFT 摘要不会清空：工具执行期间、等待下一轮响应期间都保持可见，下一条助手消息开始时才更新。
 
@@ -65,12 +62,17 @@ pi -e npm:@jack-yang/pi-tps-meter          # 只在本次启动试用，不写�
 
 | 命令 | 作用 |
 |---|---|
-| `/tps` | 循环切换 status → widget → off |
-| `/tps status` | 显示在底部状态条（footer），和其他扩展的状态共用一行 |
-| `/tps widget` | 显示为编辑器上方的单行组件 |
+| `/tps` | 循环切换 right → status → widget → off |
+| `/tps right` | 编辑器下方、右对齐（默认）：紧贴 footer，位置固定 |
+| `/tps status` | footer 的扩展状态行，和其他扩展共用一行，按扩展名排序 |
+| `/tps widget` | 编辑器上方的单行组件 |
 | `/tps off` | 完全隐藏。计量仍在后台进行，切回来立即显示当前读数 |
 
 模式写入配置文件，下次启动沿用。
+
+为什么右对齐是单独一行，而不是放进 footer 状态行的右端：pi 把所有扩展的状态按名字排序、左对齐拼成一行，扩展没法指定位置；要放到右端只能整个替换 pi 的 footer，不值得。编辑器下方的组件是自己渲染的，可以按终端宽度右对齐，窗口缩放时也贴着右边。
+
+如果也嫌 pi-lens 的 `LSP Inactive` 占地方，pi-lens 自己有开关：在 `~/.pi-lens/config.json` 里设 `ui.compactLspStatus: true`（压成一个图标）或 `ui.hideLspStatus: true`（不显示）。
 
 ## 配置
 
@@ -78,19 +80,25 @@ pi -e npm:@jack-yang/pi-tps-meter          # 只在本次启动试用，不写�
 
 ```json
 {
-  "mode": "status",
+  "mode": "right",
   "tiers": {
     "tps":  { "slow": 20, "normal": 50, "fast": 100 },
     "ttft": { "fast": 10000, "ok": 20000 }
-  }
+  },
+  "spinner": { "theme": "tech", "intervalMs": 100, "cells": 6 }
 }
 ```
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `mode` | `"status"` | `status` / `widget` / `off`。`/tps` 只改写这个键，其他内容原样保留 |
+| `mode` | `"right"` | `right` / `status` / `widget` / `off`。`/tps` 只改写这个键，其他内容原样保留 |
 | `tiers.tps` | `{ slow: 20, normal: 50, fast: 100 }` | TPS 与 AVG 的分档阈值（tok/s） |
 | `tiers.ttft` | `{ fast: 10000, ok: 20000 }` | TTFT 分档阈值（毫秒） |
+| `spinner.theme` | `"tech"` | 粒子流配色：`"tech"`（青 → 蓝 → 紫）、`"red"`（KITT 风格红）；`"none"` 关闭粒子流 |
+| `spinner.colors` | 随 theme | 自定义渐变色，`"#rrggbb"` / `"#rgb"` 数组，优先于 theme |
+| `spinner.intervalMs` | `100` | 粒子前进一格的间隔（毫秒） |
+| `spinner.cells` | `6` | 粒子流格数（宽度），至少 2 |
+| `spinner.enabled` | `true` | `false` 关闭粒子流 |
 
 - 所有键都可省略，按字段覆盖默认值，例如只写 `{ "tiers": { "tps": { "fast": 80 } } }`。不是数字的值会被忽略。
 - 文件在会话启动时读取，手动修改后执行 `/reload` 生效。
@@ -138,14 +146,14 @@ TTFT 从 `turn_start` 开始计时（在 pi 里，一个 turn 就是一次模型
 - 下一条助手消息开始时清空 TTFT，原版要等到下一个首 token 才覆盖。
 - toolcall delta 计入 TPS 和校准，因为 pi 的 `usage.output` 包含工具调用参数的 token；原版只统计文本和推理。TTFT 仍然只认文本和思考。
 - 权威 token 数直接用 `usage.output`：pi 的 output 已经包含推理 token，原版需要把 output 和 reasoning 相加。
-- 没有移植思考粒子动画，pi 自带工作指示器。
+- 思考粒子流已移植（配色预设、渐变、FIFO 流动、配置项都和原版一致），并做了原版想做但受限于 opencode 做不到的一点：每个粒子单独着色，真正从亮到暗渐隐（原版受 opentui 限制，整串只能用一种颜色）。右对齐时粒子流放在读数左边、方向镜像，读数本身不会移动。
 - 颜色用 ANSI 基本色：红 31、黄 33、绿 32、青 36，标签用暗色；原版用的是 opencode 主题槽位。
 
 ## 已知限制
 
 - **不流式输出的推理**：有些模型按推理 token 计费，但不把推理内容流式发出来。这时校准比率会顶到 3.0 上限，AVG 也会偏高（原版同样如此）。
 - **一次性返回工具参数的 provider**（如 Gemini）：消息末尾会出现一个短暂的 TPS 尖峰，消息结束后立即清除。
-- **底部状态条依赖 pi 的默认 footer**：如果另一个扩展换掉了 footer，并且不渲染扩展状态（比如 awesome-pi-themes 的 look-pack），请改用 `/tps widget`。
+- **`status` 模式依赖 pi 的默认 footer**：如果另一个扩展换掉了 footer，并且不渲染扩展状态（比如 awesome-pi-themes 的 look-pack），用默认的 `right` 或 `widget`。
 - **AVG 和校准只在当前会话内累计**：`/new`、`/resume`、`/fork`、`/reload` 会重新开始；不会从历史记录里重建。
 - **TTFT 包含客户端准备时间**：包括请求前的上下文处理（实测约 7ms）和 provider 层的自动重试等待，也就是用户实际等待的时间。
 - **时间戳取自 pi 把事件派发给扩展的时刻**：其他扩展的慢 handler 会推迟派发，从而影响读数。

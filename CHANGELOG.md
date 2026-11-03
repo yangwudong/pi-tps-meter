@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.0] - 2026-11-03
+
+- New default display `right`: one line below the editor, right-aligned so it ends in the last
+  column, directly above the footer. Other extensions' footer statuses (such as pi-lens's
+  `LSP Inactive`) can no longer push it around. `/tps` now cycles right → status → widget → off;
+  a saved `mode` in config.json still wins.
+- The thinking particle stream from opencode-tps-meter is back: while the model streams its
+  reasoning, braille particles flow away from the reading, newest brightest, fading per cell.
+  Configurable via `spinner` (`theme` tech / red / none, `colors`, `intervalMs`, `cells`, `enabled`).
+
 ## [0.1.1] - 2026-11-03
 
 - Published from GitHub Actions through npm Trusted Publishing, so this and later versions

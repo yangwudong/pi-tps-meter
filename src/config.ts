@@ -1,22 +1,26 @@
-// Display mode persistence and tier overrides — the only module that touches the filesystem.
+// Display mode persistence, tier and spinner overrides — the only module that touches the filesystem.
 //
 // File: <agent dir>/pi-tps-meter/config.json, where <agent dir> is $PI_CODING_AGENT_DIR or
 // ~/.pi/agent, resolved the same way pi resolves its own config directory.
 //
-//   { "mode": "status", "tiers": { "tps": { "slow": 20, "normal": 50, "fast": 100 },
-//                                  "ttft": { "fast": 10000, "ok": 20000 } } }
+//   { "mode": "right",
+//     "tiers": { "tps": { "slow": 20, "normal": 50, "fast": 100 }, "ttft": { "fast": 10000, "ok": 20000 } },
+//     "spinner": { "theme": "tech", "colors": ["#00e5ff", "#2979ff"], "intervalMs": 100, "cells": 6, "enabled": true } }
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import type { Tiers } from "./format.ts"
+import { parseHex, THEME_PRESETS, type Rgb, type SpinnerConfig } from "./spinner.ts"
 
-export type DisplayMode = "status" | "widget" | "off"
+// right: one line below the editor, right-aligned (a fixed spot that other extensions' footer
+// statuses cannot push around); status: pi's footer status line; widget: a line above the editor.
+export type DisplayMode = "right" | "status" | "widget" | "off"
 
 // Also the cycle order of a bare `/tps`.
-export const DISPLAY_MODES: readonly DisplayMode[] = ["status", "widget", "off"]
+export const DISPLAY_MODES: readonly DisplayMode[] = ["right", "status", "widget", "off"]
 
-export type MeterConfig = { mode: DisplayMode; tiers: Tiers }
+export type MeterConfig = { mode: DisplayMode; tiers: Tiers; spinner: SpinnerConfig }
 
 export type LoadedConfig = { config: MeterConfig; warning?: string }
 
@@ -33,16 +37,28 @@ export function nextMode(mode: DisplayMode): DisplayMode {
 // The original's resolveConfig override shape: `tiers.tps` / `tiers.ttft`, field by field over
 // the defaults. Values that are not finite numbers fall back to the default instead of reaching
 // the tier comparisons, where a string or null would silently mis-tier every reading.
+// `spinner` follows the original too: custom `colors` win over the `theme` preset, theme "none"
+// or `enabled: false` turns the stream off, `cells` is at least 2.
 export function resolveConfig(raw: unknown): MeterConfig {
   const o = isObject(raw) ? raw : {}
   const tiers = isObject(o.tiers) ? o.tiers : {}
   const tp = isObject(tiers.tps) ? tiers.tps : {}
   const tt = isObject(tiers.ttft) ? tiers.ttft : {}
+  const sp = isObject(o.spinner) ? o.spinner : {}
+  const theme = typeof sp.theme === "string" ? sp.theme : "tech"
+  const custom = hexColors(sp.colors)
+  const preset = hexColors(THEME_PRESETS[theme] ?? THEME_PRESETS.tech)
   return {
-    mode: isDisplayMode(o.mode) ? o.mode : "status",
+    mode: isDisplayMode(o.mode) ? o.mode : "right",
     tiers: {
       tps: { slow: num(tp.slow, 20), normal: num(tp.normal, 50), fast: num(tp.fast, 100) },
       ttft: { fast: num(tt.fast, 10_000), ok: num(tt.ok, 20_000) },
+    },
+    spinner: {
+      enabled: sp.enabled !== false && theme !== "none",
+      colors: custom.length > 0 ? custom : preset,
+      intervalMs: positive(sp.intervalMs) ?? 100,
+      cells: (positive(sp.cells) ?? 0) >= 2 ? Math.floor(sp.cells as number) : 6,
     },
   }
 }
@@ -104,4 +120,17 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function num(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback
+}
+
+function positive(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+// The valid "#rrggbb" / "#rgb" entries of a config value, in order; anything else is dropped.
+function hexColors(value: unknown): Rgb[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((c) => {
+    const rgb = typeof c === "string" ? parseHex(c) : undefined
+    return rgb ? [rgb] : []
+  })
 }

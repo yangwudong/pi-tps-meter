@@ -483,3 +483,34 @@ describe("calibration", () => {
     assert.ok(Math.abs(live / actualRate - 1) <= 0.15, `live ${live.toFixed(1)} vs authoritative ${actualRate.toFixed(1)}`)
   })
 })
+
+describe("thinking flag (drives the particle stream)", () => {
+  it("follows the latest delta: reasoning sets it, text and tool calls clear it", () => {
+    const s = createMeterState()
+    startMessage(s, 0)
+    assert.equal(s.thinking, false)
+    recordDelta(s, 10, "Let me think", "thinking")
+    assert.equal(s.thinking, true)
+    recordDelta(s, 20, "答案", "text")
+    assert.equal(s.thinking, false)
+    recordDelta(s, 30, "more thought", "thinking")
+    assert.equal(s.thinking, true)
+    recordDelta(s, 40, '{"path":"a.ts"', "toolcall")
+    assert.equal(s.thinking, false, "the original cleared it on tool input start")
+  })
+
+  it("is off at every message boundary", () => {
+    const s = createMeterState()
+    startMessage(s, 0)
+    recordDelta(s, 10, "hmm", "thinking")
+    completeMessage(s, 5)
+    assert.equal(s.thinking, false)
+    startMessage(s, 100)
+    recordDelta(s, 110, "hmm", "thinking")
+    abandonMessage(s)
+    assert.equal(s.thinking, false)
+    s.thinking = true
+    startMessage(s, 200)
+    assert.equal(s.thinking, false)
+  })
+})
