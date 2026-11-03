@@ -21,6 +21,8 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
       - run: npm test
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1; logged so a too-old runner npm is obvious.
+      - run: npm --version
       - name: Publish
         run: |
           NAME=$(node -p "require('./package.json').name")
@@ -31,7 +33,9 @@ jobs:
             exit 1
           fi
           # Already on npm (e.g. published by hand): nothing to do, rather than a failing run.
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+          # Compare the printed version, not the exit code: some npm versions exit 0 with empty
+          # output for a version that does not exist.
+          if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
             echo "$NAME@$VERSION is already on npm; skipping."
             exit 0
           fi
