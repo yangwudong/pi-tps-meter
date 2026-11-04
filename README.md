@@ -165,8 +165,10 @@ TTFT 从 `turn_start` 开始计时（在 pi 里，一个 turn 就是一次模型
 ```bash
 npm test                            # node --test，不需要安装依赖（Node ≥ 22.19）
 npm install && npm run typecheck    # 可选：tsc 严格检查，会装上 pi 作为 peer 依赖以获得类型
-pi -e .                             # 在真实会话中试用
+pi -ne -e .                         # 在真实会话中试用（-ne 关掉其他扩展，避免和已安装的版本同时加载）
 ```
+
+代码结构、开发规则、坑点、测试和发布流程见 [CONTRIBUTING.md](./CONTRIBUTING.md)（英文）。
 
 ## 许可证
 

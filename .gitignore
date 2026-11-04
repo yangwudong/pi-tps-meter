@@ -1,2 +1,5 @@
 node_modules/
 *.tgz
+# Not committed: every install (and CI's type check) resolves the latest pi, which is how a
+# breaking pi change shows up early.
+package-lock.json
