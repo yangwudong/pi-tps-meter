@@ -144,7 +144,7 @@ export function createTpsMeter(pi: ExtensionAPI, deps: Deps = {}): void {
         const m = entry.message
         if (m.stopReason === "error" || m.stopReason === "aborted") continue
         const physical = ctxRef.modelRegistry.find(m.provider, m.model)
-        return physical ? { model: physical, thinkingLevel: (m as { thinkingLevel?: string }).thinkingLevel } : undefined
+        return physical ? { model: physical, thinkingLevel: m.thinkingLevel } : undefined
       }
       return undefined
     },
@@ -156,15 +156,12 @@ export function createTpsMeter(pi: ExtensionAPI, deps: Deps = {}): void {
         const registry = ctxRef?.modelRegistry
         const model = ctxRef?.model
         if (!registry || model?.provider !== provider || !registry.isUsingOAuth(model)) return false
-        const p = registry.getProvider(provider) as { auth?: { oauth?: { isSubscription?: boolean } } } | undefined
-        return p?.auth?.oauth?.isSubscription === true
+        return registry.getProvider(provider)?.auth.oauth?.isSubscription === true
       },
     },
     getContextUsage: () => ctxRef?.getContextUsage(),
   }
 
-  // If pi's footer cannot be wrapped (an older or newer pi changed it), never leave the user
-  // without a footer: restore pi's, fall back to the line below the editor, say so once.
   // If pi's footer cannot be wrapped (an older or newer pi changed it), never leave the user
   // without a footer: fall back to the line below the editor (leaving footer mode is what restores
   // pi's own footer, in render()) and say so once. A mount that is no longer current (the mode
@@ -174,6 +171,16 @@ export function createTpsMeter(pi: ExtensionAPI, deps: Deps = {}): void {
     config = { ...config, mode: "right" }
     target.notify(`tps-meter: footer mode unavailable here (${reason instanceof Error ? reason.message : String(reason)}), using right`, "warning")
     render()
+  }
+
+  // pi feeds its own footer the auto-compaction flag whenever it changes; ours has to read the
+  // setting. pi.getSettings() deep-copies all settings, and the footer renders on every frame, so
+  // the flag is re-read at most once a second (a toggle in /settings shows up within that).
+  let autoCompact = { value: true, readAt: Number.NEGATIVE_INFINITY }
+  const autoCompactEnabled = (): boolean => {
+    const now = Date.now()
+    if (now - autoCompact.readAt >= 1_000) autoCompact = { value: pi.getSettings().compaction?.enabled ?? true, readAt: now }
+    return autoCompact.value
   }
 
   const mountFooter = (target: UI, epoch: number): void => {
@@ -187,8 +194,7 @@ export function createTpsMeter(pi: ExtensionAPI, deps: Deps = {}): void {
         return {
           render(width: number): string[] {
             try {
-              // pi feeds this flag to its own footer instance; ours reads the same setting.
-              inner.setAutoCompactEnabled(pi.getSettings().compaction?.enabled ?? true)
+              inner.setAutoCompactEnabled(autoCompactEnabled())
               const lines = inner.render(width)
               if (lines.length > 0 && shownLine) lines[0] = mergeFooterLine(lines[0], shownLine, width, fns)
               return lines

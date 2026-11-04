@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@jack-yang/pi-tps-meter",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "Live TPS / AVG / TTFT meter for the pi coding agent, calibrated against authoritative token counts (port of opencode-tps-meter)",
   "type": "module",
   "keywords": [
@@ -42,7 +42,8 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.0] - 2026-11-04
+
+First stable release; the behaviour is that of 0.3.0, reviewed before freezing it.
+
+- Declare `@earendil-works/pi-tui` as a peer dependency: footer mode imports it at runtime (pi
+  supplies it, as it does `@earendil-works/pi-coding-agent`).
+- Footer mode no longer deep-copies all of pi's settings on every frame to read the
+  auto-compaction flag; it re-reads the setting at most once a second.
+
 ## [0.3.0] - 2026-11-04
 
 - New default display `footer`: the meter sits at the right end of pi's footer line with the

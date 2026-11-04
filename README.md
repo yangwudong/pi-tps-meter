@@ -148,6 +148,7 @@ TTFT 从 `turn_start` 开始计时（在 pi 里，一个 turn 就是一次模型
 - toolcall delta 计入 TPS 和校准，因为 pi 的 `usage.output` 包含工具调用参数的 token；原版只统计文本和推理。TTFT 仍然只认文本和思考。
 - 权威 token 数直接用 `usage.output`：pi 的 output 已经包含推理 token，原版需要把 output 和 reasoning 相加。
 - 思考粒子流已移植（配色预设、渐变、FIFO 流动、配置项都和原版一致），并做了原版想做但受限于 opencode 做不到的一点：每个粒子单独着色，真正从亮到暗渐隐（原版受 opentui 限制，整串只能用一种颜色）。右对齐时粒子流放在读数左边、方向镜像，读数本身不会移动。
+- 显示位置：原版在 opencode 输入框右侧的 slot 里；pi 没有对应的位置，默认放在 footer 目录行右端（包装 pi 自己的 footer，不替换），另有 `right` / `status` / `widget` 可选。
 - 颜色用 ANSI 基本色：红 31、黄 33、绿 32、青 36，标签用暗色；原版用的是 opencode 主题槽位。
 
 ## 已知限制
