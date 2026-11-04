@@ -2,12 +2,13 @@
 //
 // Port of opencode-tps-meter: the measurement core (src/core.ts), the formatting (src/format.ts)
 // and the thinking particle stream (src/spinner.ts) are the original's. This file is the replaced
-// host layer: pi events in; a right-aligned line below the editor, a footer status, or a line
-// above the editor out.
+// host layer: pi events in; the meter out on pi's footer line (by wrapping pi's own footer), a
+// right-aligned line below the editor, a footer status, or a line above the editor.
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
+import type { ExtensionAPI, ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent"
 import { DISPLAY_MODES, isDisplayMode, loadConfig, nextMode, resolveConfig, saveMode, type DisplayMode, type MeterConfig } from "../src/config.ts"
 import { abandonMessage, completeMessage, createMeterState, readMeter, recordDelta, startMessage, startTurn, type DeltaKind, type MeterState } from "../src/core.ts"
+import { mergeFooterLine } from "../src/footer.ts"
 import { alignRight, renderLine, withSpinner } from "../src/format.ts"
 import { advanceSpinner, createSpinner, spinnerCells, type Rgb, type SpinnerState } from "../src/spinner.ts"
 
@@ -21,12 +22,61 @@ const REFRESH_MS = 100
 const SPINNER_MUTED: Rgb = { r: 128, g: 132, b: 142 }
 
 type UI = ExtensionContext["ui"]
+type Model = NonNullable<ExtensionContext["model"]>
+
+// The part of pi's AgentSession that pi's FooterComponent reads, rebuilt from what an extension
+// can see. pi does not hand extensions its session, but its footer only needs these members.
+export type SessionView = {
+  readonly sessionManager: ExtensionContext["sessionManager"]
+  readonly model: ExtensionContext["model"]
+  readonly state: { model: ExtensionContext["model"]; thinkingLevel: string }
+  readonly routedModel: { model: Model; thinkingLevel?: string } | undefined
+  readonly modelRuntime: { isUsingSubscription(provider: string): boolean }
+  getContextUsage(): ReturnType<ExtensionContext["getContextUsage"]>
+}
+
+export type FooterLike = { render(width: number): string[]; invalidate(): void; dispose?(): void; setAutoCompactEnabled(enabled: boolean): void }
+
+// pi runtime pieces the footer mode needs; loaded on demand (and injected in tests, which run on
+// plain Node without pi).
+export type FooterKit = {
+  createFooter(session: SessionView, footerData: ReadonlyFooterDataProvider): FooterLike
+  visibleWidth(text: string): number
+  truncateToWidth(text: string, width: number, ellipsis?: string): string
+}
+
+export type Deps = { loadFooterKit?: () => Promise<FooterKit> }
+
+async function loadPiFooterKit(): Promise<FooterKit> {
+  const [core, tuiLib] = await Promise.all([import("@earendil-works/pi-coding-agent"), import("@earendil-works/pi-tui")])
+  type Session = ConstructorParameters<typeof core.FooterComponent>[0]
+  return {
+    createFooter: (session, footerData) => {
+      // SAFETY: FooterComponent is typed to take pi's whole AgentSession, which extensions never
+      // get. In pi 1.5.0 (dist/modes/interactive/components/footer.js) it reads exactly the members
+      // SessionView provides: sessionManager.{getCwd, getEntries, getEntryCount, getLeafId,
+      // getSessionId, getSessionName}, model, state.{model, thinkingLevel}, routedModel,
+      // modelRuntime.isUsingSubscription and getContextUsage(). If a later pi reads anything else,
+      // render() throws, the wrapper catches it, and fallBack() restores pi's own footer.
+      const agentSession = session as unknown as Session
+      return new core.FooterComponent(agentSession, footerData)
+    },
+    visibleWidth: tuiLib.visibleWidth,
+    truncateToWidth: tuiLib.truncateToWidth,
+  }
+}
 
 export default function tpsMeter(pi: ExtensionAPI): void {
+  createTpsMeter(pi)
+}
+
+export function createTpsMeter(pi: ExtensionAPI, deps: Deps = {}): void {
+  const loadFooterKit = deps.loadFooterKit ?? loadPiFooterKit
   let state: MeterState = createMeterState()
   // Defaults until session_start reads the file: the factory may run in invocations that never
   // start a session, so it does no IO and starts no timers.
   let config: MeterConfig = resolveConfig(undefined)
+  let ctxRef: ExtensionContext | undefined
   let ui: UI | undefined
   let tui = false
   let ticker: ReturnType<typeof setInterval> | undefined
@@ -34,18 +84,22 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   // What is on screen right now, so unchanged readings cost no re-render.
   let shownMode: DisplayMode | undefined
   let shownLine: string | undefined
-  // The mounted right-aligned component's host, told to redraw when the line changes.
-  let rightHost: { requestRender(): void } | undefined
+  // The mounted component's host (widget or footer), told to redraw when the line changes.
+  let host: { requestRender(): void } | undefined
+  // Bumped on every mode change, so a footer mount still loading for an older mode is dropped.
+  let mountEpoch = 0
 
   // Handlers re-bind from their own ctx; the ticker only ever uses the latest binding.
   const bind = (ctx: ExtensionContext): void => {
+    ctxRef = ctx
     ui = ctx.hasUI ? ctx.ui : undefined
     // The TUI renders ANSI and components; RPC clients get plain text lines.
     tui = ctx.mode === "tui"
   }
 
   // The particle stream exists only while reasoning streams, and only in the TUI (in RPC it would
-  // just be noise at 10Hz). A fresh stream starts each time thinking starts.
+  // just be noise at 10Hz). A fresh stream starts each time thinking starts. Next to a
+  // right-aligned reading it goes on the left, so the reading itself never moves.
   const decorate = (target: UI, line: string, now: number): string => {
     if (!tui || !config.spinner.enabled || !state.thinking) {
       spinner = undefined
@@ -54,16 +108,104 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     if (spinner === undefined) spinner = createSpinner(config.spinner.cells, now, Math.random)
     else advanceSpinner(spinner, config.spinner, now, Math.random)
     const paint = (text: string, c: Rgb) => target.theme.style(text, { fg: { kind: "rgb", r: c.r, g: c.g, b: c.b } })
-    return withSpinner(line, spinnerCells(spinner, config.spinner, SPINNER_MUTED), paint, config.mode === "right" ? "before" : "after")
+    const side = config.mode === "right" || config.mode === "footer" ? "before" : "after"
+    return withSpinner(line, spinnerCells(spinner, config.spinner, SPINNER_MUTED), paint, side)
   }
 
   // A component rather than a string widget: it right-aligns itself to the width of every render,
   // so it stays in the corner across terminal resizes, and an update is only a redraw request.
   const mountRight = (target: UI): void => {
-    target.setWidget(KEY, (host) => {
-      rightHost = host
+    target.setWidget(KEY, (h) => {
+      host = h
       return { render: (width: number) => [alignRight(shownLine ?? "", width)], invalidate() {} }
     }, { placement: "belowEditor" })
+  }
+
+  // pi's own footer, fed a SessionView, with the meter merged into its first (directory) line.
+  // Everything else on the footer stays pi's rendering.
+  const sessionView: SessionView = {
+    // Only read inside a mounted footer, which exists only after bind(); a throw here is caught
+    // by the footer's render() and ends in fallBack().
+    get sessionManager() {
+      if (!ctxRef) throw new Error("no session bound")
+      return ctxRef.sessionManager
+    },
+    get model() { return ctxRef?.model },
+    get state() { return { model: ctxRef?.model, thinkingLevel: pi.getThinkingLevel() } },
+    // As pi's AgentSession.routedModel: under a virtual model, the physical model of the latest
+    // successful response.
+    get routedModel() {
+      const model = ctxRef?.model
+      if (!ctxRef || !model || model.api !== "pi-virtual") return undefined
+      const branch = ctxRef.sessionManager.getBranch()
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i]
+        if (entry.type !== "message" || entry.message.role !== "assistant") continue
+        const m = entry.message
+        if (m.stopReason === "error" || m.stopReason === "aborted") continue
+        const physical = ctxRef.modelRegistry.find(m.provider, m.model)
+        return physical ? { model: physical, thinkingLevel: (m as { thinkingLevel?: string }).thinkingLevel } : undefined
+      }
+      return undefined
+    },
+    // As pi's ModelRuntime.isUsingSubscription: OAuth credentials for a subscription provider.
+    // The footer asks this about the current model's provider; ModelRegistry.isUsingOAuth takes
+    // the model and reads its provider.
+    modelRuntime: {
+      isUsingSubscription: (provider) => {
+        const registry = ctxRef?.modelRegistry
+        const model = ctxRef?.model
+        if (!registry || model?.provider !== provider || !registry.isUsingOAuth(model)) return false
+        const p = registry.getProvider(provider) as { auth?: { oauth?: { isSubscription?: boolean } } } | undefined
+        return p?.auth?.oauth?.isSubscription === true
+      },
+    },
+    getContextUsage: () => ctxRef?.getContextUsage(),
+  }
+
+  // If pi's footer cannot be wrapped (an older or newer pi changed it), never leave the user
+  // without a footer: restore pi's, fall back to the line below the editor, say so once.
+  // If pi's footer cannot be wrapped (an older or newer pi changed it), never leave the user
+  // without a footer: fall back to the line below the editor (leaving footer mode is what restores
+  // pi's own footer, in render()) and say so once. A mount that is no longer current (the mode
+  // changed, or the session was replaced, since it started) is ignored, so a stale UI is never used.
+  const fallBack = (target: UI, epoch: number, reason: unknown): void => {
+    if (epoch !== mountEpoch || ui !== target || config.mode !== "footer") return
+    config = { ...config, mode: "right" }
+    target.notify(`tps-meter: footer mode unavailable here (${reason instanceof Error ? reason.message : String(reason)}), using right`, "warning")
+    render()
+  }
+
+  const mountFooter = (target: UI, epoch: number): void => {
+    loadFooterKit().then((kit) => {
+      if (epoch !== mountEpoch || ui !== target) return
+      target.setFooter((h, theme, footerData) => {
+        host = h
+        const inner = kit.createFooter(sessionView, footerData)
+        const unsubscribe = footerData.onBranchChange(() => h.requestRender())
+        const fns = { visibleWidth: kit.visibleWidth, truncate: (text: string, width: number) => kit.truncateToWidth(text, width, theme.fg("dim", "...")) }
+        return {
+          render(width: number): string[] {
+            try {
+              // pi feeds this flag to its own footer instance; ours reads the same setting.
+              inner.setAutoCompactEnabled(pi.getSettings().compaction?.enabled ?? true)
+              const lines = inner.render(width)
+              if (lines.length > 0 && shownLine) lines[0] = mergeFooterLine(lines[0], shownLine, width, fns)
+              return lines
+            } catch (err) {
+              // Not from inside pi's render pass: swap the footer once this frame is done.
+              queueMicrotask(() => fallBack(target, epoch, err))
+              return []
+            }
+          },
+          invalidate() { inner.invalidate() },
+          dispose() {
+            unsubscribe()
+            inner.dispose?.()
+          },
+        }
+      })
+    }, (err: unknown) => fallBack(target, epoch, err))
   }
 
   const render = (): void => {
@@ -72,11 +214,14 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     if (mode !== shownMode) {
       // Exactly one surface (or none) shows the meter: clear the one being left.
       if (shownMode === "status") ui.setStatus(KEY, undefined)
-      if (shownMode === "widget" || shownMode === "right") ui.setWidget(KEY, undefined)
-      rightHost = undefined
+      if (shownMode === "widget" || shownMode === "right" || (shownMode === "footer" && !tui)) ui.setWidget(KEY, undefined)
+      if (shownMode === "footer" && tui) ui.setFooter(undefined)
+      host = undefined
+      mountEpoch++
       shownMode = mode
       shownLine = undefined
       if (mode === "right" && tui) mountRight(ui)
+      if (mode === "footer" && tui) mountFooter(ui, mountEpoch)
     }
     if (mode === "off") return
     const now = Date.now()
@@ -85,8 +230,9 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     shownLine = line
     if (mode === "status") ui.setStatus(KEY, line)
     else if (mode === "widget") ui.setWidget(KEY, [line])
-    // RPC ignores component widgets; there the line goes out as plain text below the editor.
-    else if (tui) rightHost?.requestRender()
+    // RPC has no custom footers or component widgets; there the line goes out as plain text
+    // below the editor.
+    else if (tui) host?.requestRender()
     else ui.setWidget(KEY, [line], { placement: "belowEditor" })
   }
 
@@ -162,16 +308,18 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   })
 
   pi.on("session_shutdown", () => {
-    // pi resets extension UI itself when it reloads or replaces the runtime; the timer and the
-    // reference to this session's UI are the only things left for us to drop.
+    // pi resets extension UI itself when it reloads or replaces the runtime (including a custom
+    // footer); the timer and the references to this session are the only things left to drop.
     stopTicker()
+    mountEpoch++
     ui = undefined
-    rightHost = undefined
+    ctxRef = undefined
+    host = undefined
     spinner = undefined
   })
 
   pi.registerCommand("tps", {
-    description: "TPS meter display: /tps cycles right → status → widget → off, /tps right|status|widget|off sets it",
+    description: "TPS meter display: /tps cycles footer → right → status → widget → off, /tps footer|right|status|widget|off sets it",
     getArgumentCompletions: (prefix) => {
       // Only strict prefixes: pi's editor makes Enter apply an open argument completion instead
       // of submitting, so a fully typed mode must close the popup or `/tps off` needs two Enters.
@@ -183,7 +331,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       bind(ctx)
       const arg = args.trim().toLowerCase()
       if (arg && !isDisplayMode(arg)) {
-        ctx.ui.notify(`tps-meter: unknown mode "${arg}" (use right | status | widget | off)`, "error")
+        ctx.ui.notify(`tps-meter: unknown mode "${arg}" (use footer | right | status | widget | off)`, "error")
         return
       }
       const mode = isDisplayMode(arg) ? arg : nextMode(config.mode)

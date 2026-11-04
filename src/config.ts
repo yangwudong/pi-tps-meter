@@ -13,12 +13,13 @@ import { dirname, join } from "node:path"
 import type { Tiers } from "./format.ts"
 import { parseHex, THEME_PRESETS, type Rgb, type SpinnerConfig } from "./spinner.ts"
 
-// right: one line below the editor, right-aligned (a fixed spot that other extensions' footer
-// statuses cannot push around); status: pi's footer status line; widget: a line above the editor.
-export type DisplayMode = "right" | "status" | "widget" | "off"
+// footer: the right end of pi's own footer line with the working directory (pi's footer is wrapped,
+// not replaced); right: one line below the editor, right-aligned; status: pi's footer status line;
+// widget: a line above the editor.
+export type DisplayMode = "footer" | "right" | "status" | "widget" | "off"
 
 // Also the cycle order of a bare `/tps`.
-export const DISPLAY_MODES: readonly DisplayMode[] = ["right", "status", "widget", "off"]
+export const DISPLAY_MODES: readonly DisplayMode[] = ["footer", "right", "status", "widget", "off"]
 
 export type MeterConfig = { mode: DisplayMode; tiers: Tiers; spinner: SpinnerConfig }
 
@@ -49,7 +50,7 @@ export function resolveConfig(raw: unknown): MeterConfig {
   const custom = hexColors(sp.colors)
   const preset = hexColors(THEME_PRESETS[theme] ?? THEME_PRESETS.tech)
   return {
-    mode: isDisplayMode(o.mode) ? o.mode : "right",
+    mode: isDisplayMode(o.mode) ? o.mode : "footer",
     tiers: {
       tps: { slow: num(tp.slow, 20), normal: num(tp.normal, 50), fast: num(tp.fast, 100) },
       ttft: { fast: num(tt.fast, 10_000), ok: num(tt.ok, 20_000) },

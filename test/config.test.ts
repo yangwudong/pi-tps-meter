@@ -6,9 +6,9 @@ import { dirname, join } from "node:path"
 import { DISPLAY_MODES, agentDir, configPath, isDisplayMode, loadConfig, nextMode, resolveConfig, saveMode } from "../src/config.ts"
 
 describe("resolveConfig", () => {
-  it("defaults to the right-aligned mode, the original's thresholds and the tech spinner", () => {
+  it("defaults to the footer mode, the original's thresholds and the tech spinner", () => {
     assert.deepEqual(resolveConfig(undefined), {
-      mode: "right",
+      mode: "footer",
       tiers: { tps: { slow: 20, normal: 50, fast: 100 }, ttft: { fast: 10_000, ok: 20_000 } },
       spinner: {
         enabled: true,
@@ -28,7 +28,7 @@ describe("resolveConfig", () => {
 
   it("falls back on malformed values instead of mis-tiering", () => {
     const c = resolveConfig({ mode: "loud", tiers: { tps: { slow: "20", normal: null, fast: NaN }, ttft: [] } })
-    assert.equal(c.mode, "right")
+    assert.equal(c.mode, "footer")
     assert.deepEqual(c.tiers, resolveConfig(undefined).tiers)
     assert.deepEqual(resolveConfig([1, 2]), resolveConfig(undefined))
     assert.deepEqual(resolveConfig("status"), resolveConfig(undefined))
@@ -55,16 +55,17 @@ describe("resolveConfig", () => {
 })
 
 describe("display modes", () => {
-  it("cycles right → status → widget → off → right", () => {
-    assert.deepEqual(DISPLAY_MODES, ["right", "status", "widget", "off"])
+  it("cycles footer → right → status → widget → off → footer", () => {
+    assert.deepEqual(DISPLAY_MODES, ["footer", "right", "status", "widget", "off"])
+    assert.equal(nextMode("footer"), "right")
     assert.equal(nextMode("right"), "status")
     assert.equal(nextMode("status"), "widget")
     assert.equal(nextMode("widget"), "off")
-    assert.equal(nextMode("off"), "right")
+    assert.equal(nextMode("off"), "footer")
   })
 
-  it("recognises only the four modes", () => {
-    assert.ok(isDisplayMode("right") && isDisplayMode("status") && isDisplayMode("widget") && isDisplayMode("off"))
+  it("recognises only the five modes", () => {
+    assert.ok(["footer", "right", "status", "widget", "off"].every(isDisplayMode))
     assert.ok(!isDisplayMode("live") && !isDisplayMode("") && !isDisplayMode(undefined))
   })
 })

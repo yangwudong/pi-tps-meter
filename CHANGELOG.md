@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0] - 2026-11-04
+
+- New default display `footer`: the meter sits at the right end of pi's footer line with the
+  working directory, in line with the model name below it, without taking an extra line. pi's
+  own `FooterComponent` still renders the whole footer (the stats and status lines are
+  byte-for-byte pi's); the meter is merged into its first line. On a narrow terminal the
+  directory is shortened first, so the reading stays whole.
+- If pi's footer cannot be wrapped (for example a future pi changes its internals), pi's own
+  footer is restored and the meter falls back to `right`, with a one-time notice.
+- `/tps` cycles footer → right → status → widget → off; a saved `mode` still wins.
+
 ## [0.2.0] - 2026-11-03
 
 - New default display `right`: one line below the editor, right-aligned so it ends in the last

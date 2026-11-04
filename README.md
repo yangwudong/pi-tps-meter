@@ -12,9 +12,9 @@
 ⠔⠀⠈⠀⠤⠔ TPS 42.5 | AVG 38.2 | TTFT 0.8s
 ```
 
-默认显示在编辑器下方、右对齐（`/tps right`），紧贴 footer，和下方的模型名右侧对齐；位置固定，不会被其他扩展的 footer 状态（比如 pi-lens 的 `LSP Inactive`）挤开。下图是模型思考时的样子，读数左边是思考粒子流：
+默认显示在 footer 的目录那一行右端（`/tps footer`），和下一行的模型名右对齐，不额外占行；其他扩展的 footer 状态（比如 pi-lens 的 `LSP Inactive`）也挤不动它。下图是模型思考时的样子，读数左边是思考粒子流：
 
-![编辑器下方右对齐：思考中，粒子流 + TPS 26.0 / AVG 33.7 / TTFT 3.9s](https://raw.githubusercontent.com/yangwudong/pi-tps-meter/main/docs/screenshot-right.png)
+![footer 目录行右端：思考中，粒子流 + TPS 38.2 / AVG 62.2 / TTFT 1.9s](https://raw.githubusercontent.com/yangwudong/pi-tps-meter/main/docs/screenshot-footer.png)
 
 - **TPS**：流式输出时的实时速度，基于 5 秒滑动窗口，约 10Hz 刷新；超过 1.5 秒没有新 token 时显示 `--`。
 - **AVG**：会话级累计平均。所有已完成消息的权威 token 数之和，除以各消息生成时长之和。
@@ -62,15 +62,16 @@ pi -e npm:@jack-yang/pi-tps-meter          # 只在本次启动试用，不写�
 
 | 命令 | 作用 |
 |---|---|
-| `/tps` | 循环切换 right → status → widget → off |
-| `/tps right` | 编辑器下方、右对齐（默认）：紧贴 footer，位置固定 |
+| `/tps` | 循环切换 footer → right → status → widget → off |
+| `/tps footer` | footer 的目录那一行右端（默认），不额外占行 |
+| `/tps right` | 编辑器下方单独一行，右对齐，紧贴 footer |
 | `/tps status` | footer 的扩展状态行，和其他扩展共用一行，按扩展名排序 |
 | `/tps widget` | 编辑器上方的单行组件 |
 | `/tps off` | 完全隐藏。计量仍在后台进行，切回来立即显示当前读数 |
 
 模式写入配置文件，下次启动沿用。
 
-为什么右对齐是单独一行，而不是放进 footer 状态行的右端：pi 把所有扩展的状态按名字排序、左对齐拼成一行，扩展没法指定位置；要放到右端只能整个替换 pi 的 footer，不值得。编辑器下方的组件是自己渲染的，可以按终端宽度右对齐，窗口缩放时也贴着右边。
+`footer` 模式是怎么做的：pi 的 footer 没有给扩展留定位的口子（扩展状态只能左对齐拼在最后一行），所以这里用 `setFooter` 挂了一个包装层：里面跑的就是 pi 自己导出的 `FooterComponent`，统计行、状态行都由 pi 自己渲染，实测和原装 footer 逐字符、连颜色都一致；只是在目录那一行右端补上读数。终端变窄时先截短目录（和 pi 一样用 `...`），读数保持完整；中文目录名按双宽字符计算。如果将来某个 pi 版本改了 footer 内部导致包装失败，会自动恢复 pi 原装 footer、退回 `right` 模式并提示一次，不会把 footer 弄坏。
 
 如果也嫌 pi-lens 的 `LSP Inactive` 占地方，pi-lens 自己有开关：在 `~/.pi-lens/config.json` 里设 `ui.compactLspStatus: true`（压成一个图标）或 `ui.hideLspStatus: true`（不显示）。
 
@@ -80,7 +81,7 @@ pi -e npm:@jack-yang/pi-tps-meter          # 只在本次启动试用，不写�
 
 ```json
 {
-  "mode": "right",
+  "mode": "footer",
   "tiers": {
     "tps":  { "slow": 20, "normal": 50, "fast": 100 },
     "ttft": { "fast": 10000, "ok": 20000 }
@@ -91,7 +92,7 @@ pi -e npm:@jack-yang/pi-tps-meter          # 只在本次启动试用，不写�
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `mode` | `"right"` | `right` / `status` / `widget` / `off`。`/tps` 只改写这个键，其他内容原样保留 |
+| `mode` | `"footer"` | `footer` / `right` / `status` / `widget` / `off`。`/tps` 只改写这个键，其他内容原样保留 |
 | `tiers.tps` | `{ slow: 20, normal: 50, fast: 100 }` | TPS 与 AVG 的分档阈值（tok/s） |
 | `tiers.ttft` | `{ fast: 10000, ok: 20000 }` | TTFT 分档阈值（毫秒） |
 | `spinner.theme` | `"tech"` | 粒子流配色：`"tech"`（青 → 蓝 → 紫）、`"red"`（KITT 风格红）；`"none"` 关闭粒子流 |
@@ -153,7 +154,7 @@ TTFT 从 `turn_start` 开始计时（在 pi 里，一个 turn 就是一次模型
 
 - **不流式输出的推理**：有些模型按推理 token 计费，但不把推理内容流式发出来。这时校准比率会顶到 3.0 上限，AVG 也会偏高（原版同样如此）。
 - **一次性返回工具参数的 provider**（如 Gemini）：消息末尾会出现一个短暂的 TPS 尖峰，消息结束后立即清除。
-- **`status` 模式依赖 pi 的默认 footer**：如果另一个扩展换掉了 footer，并且不渲染扩展状态（比如 awesome-pi-themes 的 look-pack），用默认的 `right` 或 `widget`。
+- **`footer` 和其他替换 footer 的扩展互斥**：pi 同一时间只有一个 footer，后设置的生效。如果还开着 awesome-pi-themes 的 look-pack 这类扩展，改用 `/tps right`。`status` 模式也依赖 pi 的默认 footer（look-pack 不渲染扩展状态）。
 - **AVG 和校准只在当前会话内累计**：`/new`、`/resume`、`/fork`、`/reload` 会重新开始；不会从历史记录里重建。
 - **TTFT 包含客户端准备时间**：包括请求前的上下文处理（实测约 7ms）和 provider 层的自动重试等待，也就是用户实际等待的时间。
 - **时间戳取自 pi 把事件派发给扩展的时刻**：其他扩展的慢 handler 会推迟派发，从而影响读数。

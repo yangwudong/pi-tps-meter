@@ -7,14 +7,14 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
-import tpsMeter from "../extensions/index.ts"
+import { createTpsMeter, type FooterKit, type SessionView } from "../extensions/index.ts"
 import { visibleWidth } from "../src/format.ts"
 
 type Handler = (event: Record<string, unknown>, ctx: unknown) => unknown
 type Command = { handler: (args: string, ctx: unknown) => Promise<void>; getArgumentCompletions?: (prefix: string) => unknown }
 type Component = { render(width: number): string[] }
 type Factory = (host: { requestRender(): void }, theme: unknown) => Component
-type UiCall = { surface: "status" | "widget"; value: string | string[] | undefined; placement?: string; at: number }
+type UiCall = { surface: "status" | "widget" | "footer"; value: string | string[] | undefined; placement?: string; at: number }
 
 const IDLE = "TPS -- | AVG -- | TTFT --"
 const BRAILLE = /[\u2800-\u28ff]/
@@ -28,15 +28,45 @@ const writeConfig = (cfg: unknown) => {
   writeFileSync(configFile(), typeof cfg === "string" ? cfg : JSON.stringify(cfg))
 }
 
+// Stands in for pi's FooterComponent: three lines like pi's (directory, stats, statuses), built
+// from the SessionView it is given, so tests can see what the wrapper passes through.
+function fakeKit(over: { fail?: string; throwOnRender?: boolean } = {}) {
+  const seen: { session?: SessionView; autoCompact?: boolean; disposed: number } = { disposed: 0 }
+  const kit: FooterKit = {
+    createFooter(session) {
+      seen.session = session
+      return {
+        render(width: number) {
+          if (over.throwOnRender) throw new Error("footer internals changed")
+          const dir = `\x1b[2m${session.sessionManager.getCwd()} (main)\x1b[22m`
+          const stats = `${session.state.thinkingLevel} ${seen.autoCompact ? "(auto)" : ""}`.padEnd(width).slice(0, width)
+          return [dir, stats, "LSP Inactive"]
+        },
+        invalidate() {},
+        dispose() { seen.disposed++ },
+        setAutoCompactEnabled(enabled: boolean) { seen.autoCompact = enabled },
+      }
+    },
+    visibleWidth: (t) => [...t.replace(/\x1b\[[0-9;]*m/g, "")].length,
+    truncateToWidth: (t, w, e = "...") => {
+      const p = [...t.replace(/\x1b\[[0-9;]*m/g, "")]
+      return p.length <= w ? t : p.slice(0, Math.max(0, w - 3)).join("") + e
+    },
+  }
+  return { seen, load: () => (over.fail ? Promise.reject(new Error(over.fail)) : Promise.resolve(kit)) }
+}
+
 // `display` writes config.json before session_start reads it; `ctxMode` is pi's run mode.
-function setup(opts: { ctxMode?: "tui" | "rpc"; hasUI?: boolean; display?: string; config?: object } = {}) {
+function setup(opts: { ctxMode?: "tui" | "rpc"; hasUI?: boolean; display?: string; config?: object; kit?: ReturnType<typeof fakeKit> } = {}) {
   if (opts.display || opts.config) writeConfig({ ...opts.config, ...(opts.display ? { mode: opts.display } : {}) })
   const handlers = new Map<string, Handler[]>()
   const commands = new Map<string, Command>()
   const calls: UiCall[] = []
   const notes: { message: string; level?: string }[] = []
   const host = { renders: 0, requestRender() { host.renders++ } }
+  const kit = opts.kit ?? fakeKit()
   let component: Component | undefined
+  let footer: (Component & { dispose?(): void }) | undefined
   const ui = {
     // Same output shape as pi's theme.style() for an RGB colour (truecolor SGR + default-fg reset),
     // so width measurement sees exactly what it sees in pi.
@@ -55,11 +85,24 @@ function setup(opts: { ctxMode?: "tui" | "rpc"; hasUI?: boolean; display?: strin
       if (content === undefined) component = undefined
       calls.push({ surface: "widget", value: content, placement: options?.placement, at: Date.now() })
     },
+    setFooter(factory: ((h: unknown, theme: unknown, data: unknown) => Component & { dispose?(): void }) | undefined) {
+      footer?.dispose?.()
+      footer = factory?.(host, { fg: (_c: string, t: string) => t }, { onBranchChange: () => () => {} })
+      calls.push({ surface: "footer", value: factory ? "<footer>" : undefined, at: Date.now() })
+    },
     notify(message: string, level?: string) {
       notes.push({ message, level })
     },
   }
-  const ctx = { hasUI: opts.hasUI ?? true, mode: opts.ctxMode ?? "rpc", ui }
+  const ctx = {
+    hasUI: opts.hasUI ?? true,
+    mode: opts.ctxMode ?? "rpc",
+    ui,
+    model: { id: "glm", provider: "magpie", api: "openai-completions" },
+    sessionManager: { getCwd: () => "~/workspaces/personal/troubleshooting", getBranch: () => [] },
+    modelRegistry: { isUsingOAuth: () => false, getProvider: () => undefined, find: () => undefined },
+    getContextUsage: () => undefined,
+  }
   const pi = {
     on(event: string, handler: Handler) {
       handlers.set(event, [...(handlers.get(event) ?? []), handler])
@@ -68,8 +111,13 @@ function setup(opts: { ctxMode?: "tui" | "rpc"; hasUI?: boolean; display?: strin
     registerCommand(name: string, options: Command) {
       commands.set(name, options)
     },
+    getThinkingLevel: () => "max",
+    getSettings: () => ({ compaction: { enabled: true } }),
   }
-  tpsMeter(pi as unknown as ExtensionAPI)
+  // SAFETY: the fake implements exactly the ExtensionAPI members the extension calls (on,
+  // registerCommand, getThinkingLevel, getSettings); a missing one fails the test that needs it.
+  const api = pi as unknown as ExtensionAPI
+  createTpsMeter(api, { loadFooterKit: kit.load })
 
   const emit = (type: string, payload: Record<string, unknown> = {}) => {
     for (const handler of handlers.get(type) ?? []) handler({ type, ...payload }, ctx)
@@ -82,8 +130,11 @@ function setup(opts: { ctxMode?: "tui" | "rpc"; hasUI?: boolean; display?: strin
     notes,
     host,
     emit,
+    kit,
     // What the mounted right-aligned component draws at `width` columns.
     rendered: (width = 80) => component?.render(width)[0],
+    // What the wrapped footer draws at `width` columns (undefined when pi's own footer is up).
+    footerLines: (width = 80) => footer?.render(width),
     tps: (args: string) => commands.get("tps")!.handler(args, ctx),
     statusLines,
     lastStatus: () => statusLines().at(-1),
@@ -135,11 +186,12 @@ describe("wiring", () => {
     assert.ok(h.commands.has("tps"))
   })
 
-  it("offers the four modes as /tps completions, and none once a mode is fully typed", () => {
+  it("offers the five modes as /tps completions, and none once a mode is fully typed", () => {
     const complete = setup().commands.get("tps")!.getArgumentCompletions!
     assert.deepEqual(complete("w"), [{ value: "widget", label: "widget" }])
     assert.deepEqual(complete("r"), [{ value: "right", label: "right" }])
-    assert.equal((complete("") as unknown[]).length, 4)
+    assert.deepEqual(complete("f"), [{ value: "footer", label: "footer" }])
+    assert.equal((complete("") as unknown[]).length, 5)
     assert.equal(complete("x"), null)
     // an open completion would swallow Enter in pi's editor
     assert.equal(complete("right"), null)
@@ -158,16 +210,139 @@ describe("wiring", () => {
   })
 })
 
-describe("right-aligned below the editor (default)", () => {
-  it("mounts one component below the editor in the TUI", () => {
+describe("on pi's footer line (default)", () => {
+  // The footer mounts once the pi pieces are loaded (a dynamic import in pi): a microtask.
+  const ready = () => Promise.resolve()
+
+  it("wraps pi's footer and puts the meter at the right end of the directory line", async () => {
     const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    assert.deepEqual(h.calls.map((c) => c.surface), ["footer"], "no widget line, no status: just the footer")
+    const [dir, stats, statuses] = h.footerLines(100)!
+    assert.match(plain(dir), /^~\/workspaces\/personal\/troubleshooting \(main\) +TPS -- \| AVG -- \| TTFT --$/)
+    assert.equal(visibleWidth(dir), 100)
+    assert.equal(statuses, "LSP Inactive", "pi's other lines pass through untouched")
+    assert.equal(stats.length, 100)
+  })
+
+  it("follows the terminal width on every render", async () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    for (const width of [70, 120, 200]) {
+      const dir = h.footerLines(width)![0]
+      assert.equal(visibleWidth(dir), width)
+      assert.ok(plain(dir).endsWith("TTFT --"))
+    }
+  })
+
+  it("updates by redraw requests, never by re-mounting", async () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    h.turnStart()
+    mock.timers.tick(700)
+    h.messageStart()
+    stream(h, 30, 50)
+    assert.equal(h.calls.length, 1, "the one footer mount")
+    assert.ok(h.host.renders > 10, `${h.host.renders} redraw requests`)
+    assert.match(plain(h.footerLines()![0]), /TPS \d.* \| TTFT 0\.8s$/)
+  })
+
+  it("puts the particle stream before the reading, so the reading never moves", async () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    h.turnStart()
+    h.messageStart()
+    stream(h, 10, 50, "thinking_delta")
+    const dir = plain(h.footerLines(100)![0])
+    assert.match(dir, /[\u2800-\u28ff]{6} TPS \S+ \| AVG -- \| TTFT 0\.1s$/)
+  })
+
+  it("feeds pi's footer what pi's own session would: thinking level, (auto), subscription, routing", async () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    h.footerLines(80)
+    const view = h.kit.seen.session!
+    assert.equal(view.state.thinkingLevel, "max")
+    assert.equal(h.kit.seen.autoCompact, true, "compaction.enabled from pi.getSettings()")
+    assert.equal(view.model?.id, "glm")
+    assert.equal(view.routedModel, undefined, "not a virtual model")
+    assert.equal(view.modelRuntime.isUsingSubscription("magpie"), false)
+    assert.equal(view.sessionManager.getCwd(), "~/workspaces/personal/troubleshooting")
+  })
+
+  it("restores pi's own footer and falls back to the line below the editor when it cannot load", async () => {
+    const h = setup({ ctxMode: "tui", kit: fakeKit({ fail: "no FooterComponent in this pi" }) })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    await ready()
+    // pi's own footer was never replaced, so restoring it is the one setFooter(undefined) call
+    assert.deepEqual(h.calls.map((c) => [c.surface, c.value, c.placement]), [["footer", undefined, undefined], ["widget", "<component>", "belowEditor"]])
+    assert.match(h.notes.at(-1)!.message, /footer mode unavailable here \(no FooterComponent in this pi\), using right/)
+    assert.equal(plain(h.rendered(60)).trimStart(), IDLE)
+  })
+
+  it("does the same when pi's footer throws while rendering, after the frame", async () => {
+    const h = setup({ ctxMode: "tui", kit: fakeKit({ throwOnRender: true }) })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    assert.deepEqual(h.footerLines(80), [], "the failing frame draws nothing rather than crashing pi")
+    await ready()
+    assert.equal(h.calls.at(-1)!.surface, "widget")
+    assert.equal(h.footerLines(80), undefined, "pi's own footer is back")
+    assert.equal(h.notes.at(-1)!.level, "warning")
+  })
+
+  it("drops a footer mount that is still loading when the mode changes", async () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await h.tps("status") // before the footer kit resolved
+    await ready()
+    assert.ok(!h.calls.some((c) => c.surface === "footer" && c.value === "<footer>"), "no stale footer mount")
+    assert.equal(plain(h.lastStatus()), IDLE)
+  })
+
+  it("restores pi's footer when switching away and disposes the wrapper", async () => {
+    const h = setup({ ctxMode: "tui" })
+    h.emit("session_start", { reason: "startup" })
+    await ready()
+    h.footerLines(80)
+    await h.tps("status")
+    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value === undefined]), [["footer", true], ["status", false]])
+    assert.equal(h.kit.seen.disposed, 1)
+  })
+
+  it("ignores a late footer failure from a session that has since shut down", async () => {
+    const h = setup({ ctxMode: "tui", kit: fakeKit({ fail: "too late" }) })
+    h.emit("session_start", { reason: "startup" })
+    h.emit("session_shutdown", { reason: "new" })
+    await ready()
+    await ready()
+    assert.deepEqual(h.calls, [], "nothing was touched after shutdown")
+    assert.deepEqual(h.notes, [])
+  })
+
+  it("uses plain lines below the editor in RPC, which has no custom footers", () => {
+    const h = setup({ ctxMode: "rpc" })
+    h.emit("session_start", { reason: "startup" })
+    assert.deepEqual(h.calls, [{ surface: "widget", value: [IDLE], placement: "belowEditor", at: 0 }])
+  })
+})
+
+describe("right-aligned below the editor", () => {
+  it("mounts one component below the editor in the TUI", () => {
+    const h = setup({ ctxMode: "tui", display: "right" })
     h.emit("session_start", { reason: "startup" })
     assert.deepEqual(h.calls.map((c) => [c.surface, c.value, c.placement]), [["widget", "<component>", "belowEditor"]])
     assert.equal(plain(h.rendered(40)).trimStart(), IDLE)
   })
 
   it("ends in the last column at every width, so it stays in the corner across resizes", () => {
-    const h = setup({ ctxMode: "tui" })
+    const h = setup({ ctxMode: "tui", display: "right" })
     h.emit("session_start", { reason: "startup" })
     for (const width of [40, 80, 140]) {
       const line = h.rendered(width)!
@@ -177,7 +352,7 @@ describe("right-aligned below the editor (default)", () => {
   })
 
   it("updates by redraw requests, never by re-mounting", () => {
-    const h = setup({ ctxMode: "tui" })
+    const h = setup({ ctxMode: "tui", display: "right" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     mock.timers.tick(700)
@@ -190,7 +365,7 @@ describe("right-aligned below the editor (default)", () => {
   })
 
   it("falls back to plain lines below the editor in RPC, which ignores components", () => {
-    const h = setup({ ctxMode: "rpc" })
+    const h = setup({ ctxMode: "rpc", display: "right" })
     h.emit("session_start", { reason: "startup" })
     assert.deepEqual(h.calls.at(-1), { surface: "widget", value: [IDLE], placement: "belowEditor", at: 0 })
   })
@@ -319,7 +494,7 @@ describe("streaming", () => {
 
 describe("thinking particle stream", () => {
   it("flows before a right-aligned reading while reasoning streams, and stops when text starts", () => {
-    const h = setup({ ctxMode: "tui" })
+    const h = setup({ ctxMode: "tui", display: "right" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
@@ -340,7 +515,7 @@ describe("thinking particle stream", () => {
   })
 
   it("keeps moving through a pause in the reasoning stream", () => {
-    const h = setup({ ctxMode: "tui" })
+    const h = setup({ ctxMode: "tui", display: "right" })
     h.emit("session_start", { reason: "startup" })
     h.turnStart()
     h.messageStart()
@@ -390,17 +565,23 @@ describe("thinking particle stream", () => {
 })
 
 describe("/tps", () => {
-  it("cycles right → status → widget → off → right, moving the meter and persisting the mode", async () => {
-    const h = setup()
+  it("cycles footer → right → status → widget → off → footer, moving the meter and persisting the mode", async () => {
+    const h = setup({ ctxMode: "tui" })
     h.emit("session_start", { reason: "startup" })
-    assert.deepEqual(h.calls.at(-1), { surface: "widget", value: [IDLE], placement: "belowEditor", at: 0 })
+    await Promise.resolve()
+    assert.deepEqual(h.calls.map((c) => [c.surface, c.value]), [["footer", "<footer>"]])
 
     await h.tps("")
-    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value]), [["widget", undefined], ["status", IDLE]])
+    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value, c.placement]), [["footer", undefined, undefined], ["widget", "<component>", "belowEditor"]])
+    assert.equal(savedMode(), "right")
+
+    await h.tps("")
+    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, plain(c.value)]), [["widget", "undefined"], ["status", IDLE]])
     assert.equal(savedMode(), "status")
 
     await h.tps("")
-    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value, c.placement]), [["status", undefined, undefined], ["widget", [IDLE], undefined]])
+    assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.placement]), [["status", undefined], ["widget", undefined]])
+    assert.equal(plain((h.calls.at(-1)!.value as string[])[0]), IDLE)
     assert.equal(savedMode(), "widget")
 
     await h.tps("")
@@ -408,8 +589,9 @@ describe("/tps", () => {
     assert.equal(savedMode(), "off")
 
     await h.tps("")
-    assert.deepEqual(h.calls.at(-1), { surface: "widget", value: [IDLE], placement: "belowEditor", at: 0 })
-    assert.deepEqual(h.notes.map((n) => n.message), ["tps-meter: status", "tps-meter: widget", "tps-meter: off", "tps-meter: right"])
+    await Promise.resolve()
+    assert.deepEqual(h.calls.at(-1), { surface: "footer", value: "<footer>", at: 0 })
+    assert.deepEqual(h.notes.map((n) => n.message), ["tps-meter: right", "tps-meter: status", "tps-meter: widget", "tps-meter: off", "tps-meter: footer"])
   })
 
   it("sets a mode directly and rejects unknown ones", async () => {
@@ -418,7 +600,7 @@ describe("/tps", () => {
     await h.tps("off")
     assert.equal(h.lastStatus(), undefined)
     await h.tps("loud")
-    assert.deepEqual(h.notes.at(-1), { message: 'tps-meter: unknown mode "loud" (use right | status | widget | off)', level: "error" })
+    assert.deepEqual(h.notes.at(-1), { message: 'tps-meter: unknown mode "loud" (use footer | right | status | widget | off)', level: "error" })
     assert.equal(savedMode(), "off")
   })
 
@@ -439,7 +621,7 @@ describe("/tps", () => {
   })
 
   it("switching from right unmounts the component", async () => {
-    const h = setup({ ctxMode: "tui" })
+    const h = setup({ ctxMode: "tui", display: "right" })
     h.emit("session_start", { reason: "startup" })
     await h.tps("status")
     assert.deepEqual(h.calls.slice(-2).map((c) => [c.surface, c.value]), [["widget", undefined], ["status", h.lastStatus()]])
@@ -459,7 +641,7 @@ describe("/tps", () => {
 
   it("reports an unparsable config file without overwriting it", async () => {
     writeConfig("{ nope")
-    const h = setup()
+    const h = setup({ ctxMode: "rpc" })
     h.emit("session_start", { reason: "startup" })
     assert.equal(h.notes[0].level, "warning")
     await h.tps("widget")
